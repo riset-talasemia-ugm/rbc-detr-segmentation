@@ -360,6 +360,41 @@ def test_to_instances_drops_background_slot():
     assert to_instances(only_bg, (10, 10), num_classes=3).masks.shape == (0, 10, 10)
 
 
+def test_decode_masks_resizes_and_thresholds_logits():
+    from evaluate import decode_masks
+
+    logits = np.full((1, 4, 4), -5.0, np.float32)
+    logits[0, :2, :2] = 5.0  # kuadran kiri-atas positif
+    m = decode_masks(logits, (8, 8))
+    assert m.shape == (1, 8, 8) and m.dtype == bool
+    assert m[0, :3, :3].all() and not m[0, 5:, 5:].any()
+    assert decode_masks(np.zeros((0, 4, 4), np.float32), (6, 7)).shape == (0, 6, 7)
+
+
+def test_calibration_reader_yields_expected_shape():
+    try:
+        import rfdetr  # noqa: F401  (preprocess_to_nchw berasal dari rfdetr)
+    except ImportError:
+        print("SKIP test_calibration_reader_yields_expected_shape (rfdetr tidak terpasang)")
+        return
+    from compress import ImageCalibrationReader
+
+    with tempfile.TemporaryDirectory() as t:
+        paths = []
+        for i in range(3):
+            p = Path(t) / f"c{i}.jpg"
+            Image.new("RGB", (20 + i, 12), (i * 50, 20, 20)).save(p)
+            paths.append(p)
+        reader = ImageCalibrationReader(paths, "input", 16, 16)
+        got = []
+        while (batch := reader.get_next()) is not None:
+            got.append(batch)
+        assert len(got) == 3
+        assert all(list(b) == ["input"] and b["input"].shape == (1, 3, 16, 16) and b["input"].dtype == np.float32 for b in got)
+        reader.rewind()
+        assert reader.get_next() is not None  # bisa diulang (kuantisasi membaca data lebih dari sekali)
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0

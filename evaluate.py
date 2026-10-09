@@ -153,6 +153,45 @@ class TorchPredictor:
         return self.model.predict(image, threshold=threshold)
 
 
+def decode_masks(mask_logits: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """Logit mask (K, Hm, Wm) -> bool (K, H, W): resize bilinear lalu > 0, sama seperti RFDETR.predict()."""
+    import torch
+    import torch.nn.functional as F
+
+    k = mask_logits.shape[0]
+    if k == 0:
+        return np.zeros((0, *size), bool)
+    t = torch.from_numpy(np.ascontiguousarray(mask_logits)).float().unsqueeze(1)
+    out = [F.interpolate(t[i : i + 32], size=size, mode="bilinear", align_corners=False) > 0 for i in range(0, k, 32)]
+    return torch.cat(out).squeeze(1).numpy()
+
+
+class OrtPredictor:
+    """Prediktor ONNX Runtime (varian int8): preprocess dan decode mengikuti referensi rfdetr; mask lewat decode_masks."""
+
+    def __init__(self, name: str, onnx_path: Path):
+        import onnxruntime as ort
+
+        want = [p for p in ("TensorrtExecutionProvider", "CUDAExecutionProvider") if p in ort.get_available_providers()]
+        want = [p for p in want if p != "TensorrtExecutionProvider"]  # TensorRT EP membangun engine saat pertama jalan; pakai CUDA EP
+        self.name = name
+        self.session = ort.InferenceSession(str(onnx_path), providers=want + ["CPUExecutionProvider"])
+        self.providers = self.session.get_providers()  # dicatat ke summary: bila hanya CPU, latency tidak sebanding dengan GPU
+        inp = self.session.get_inputs()[0]
+        self.input_name, (_, _, self.h, self.w) = inp.name, inp.shape
+        self.out_names = [o.name for o in self.session.get_outputs()]
+
+    def predict(self, image, threshold: float):
+        import supervision as sv
+        from rfdetr.export._runtime.decode import decode_detections
+        from rfdetr.export._runtime.preprocess import preprocess_to_nchw
+
+        outs = dict(zip(self.out_names, self.session.run(None, {self.input_name: preprocess_to_nchw(image, self.h, self.w, 3)})))
+        dec = decode_detections(outs["dets"][0], outs["labels"][0], image.size, threshold=threshold, background_class_id=-1)
+        masks = decode_masks(outs["masks"][0][dec.query_index], (image.height, image.width))
+        return sv.Detections(xyxy=dec.xyxy, confidence=dec.confidence, class_id=dec.class_id.astype(int), mask=masks)
+
+
 def to_instances(det, size: tuple[int, int], num_classes: int | None = None) -> Instances:
     """sv.Detections -> Instances. size = (tinggi, lebar) gambar asli. Tanpa mask -> tidak ada instance.
     class_id >= num_classes adalah slot no-object rfdetr (muncul pada threshold rendah) dan dibuang."""
@@ -172,6 +211,8 @@ def load_predictor(variant: str, fold_dir: Path, num_classes: int) -> Predictor:
         if variant == "fp16":
             model.inference(compile=False, inplace=True, dtype="float16")  # tidak dapat dibalik; hanya untuk inference
         return TorchPredictor(variant, model)
+    if variant == "int8":
+        return OrtPredictor(variant, Path(fold_dir) / "variants/int8/model_int8.onnx")
     if variant == "prune_structured":
         import torch
         from rfdetr import RFDETRSegSmall

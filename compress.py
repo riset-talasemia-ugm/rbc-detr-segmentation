@@ -5,6 +5,11 @@ import shutil
 import traceback
 from pathlib import Path
 
+try:
+    from onnxruntime.quantization import CalibrationDataReader as _ReaderBase
+except ImportError:  # onnxruntime tidak terpasang: hanya int8 yang butuh
+    _ReaderBase = object
+
 PRUNE_SKIP = ("embed", "query_feat")  # embedding/query yang dipelajari tidak dipangkas
 # ponytail: heuristik berdasarkan nama kunci (Linear/Conv/in_proj = tensor ndim>=2 ber-"weight"); ganti per-modul bila ada layer aneh
 
@@ -120,11 +125,59 @@ def build_prune_structured(fold: Path, dest: Path, args) -> dict:
     return prune_structured(fold, dest / "weights.pth", args.structured_ratio, args.finetune_epochs)
 
 
+class ImageCalibrationReader(_ReaderBase):
+    """Pembaca kalibrasi ORT: satu gambar per batch, diproses persis seperti RFDETR.predict()."""
+
+    def __init__(self, paths, input_name: str, height: int, width: int):
+        self.paths, self.input_name, self.height, self.width = list(paths), input_name, height, width
+        self.rewind()
+
+    def rewind(self) -> None:
+        self._it = iter(self.paths)
+
+    def get_next(self):
+        from PIL import Image
+        from rfdetr.export._runtime.preprocess import preprocess_to_nchw  # modul privat; rfdetr dipin ke 1.11.2
+
+        path = next(self._it, None)
+        if path is None:
+            return None
+        with Image.open(path) as img:
+            return {self.input_name: preprocess_to_nchw(img, self.height, self.width, 3)}
+
+
+def export_int8(weights: Path, num_classes: int, calib_images: list, out_path: Path, n_calib: int = 100) -> Path:
+    """Ekspor ONNX (fp32) lalu kuantisasi statis INT8 (QDQ, per-channel) dengan kalibrasi dari calib_images."""
+    import onnxruntime as ort
+    from onnxruntime.quantization import QuantFormat, QuantType, quantize_static
+    from rfdetr import RFDETRSegSmall
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    model = RFDETRSegSmall(pretrain_weights=str(weights), num_classes=num_classes)
+    fp32 = Path(model.export(output_dir=str(out_path.parent / "onnx_fp32"), format="onnx", fp16=False, verbose=False))
+    inp = ort.InferenceSession(str(fp32), providers=["CPUExecutionProvider"]).get_inputs()[0]
+    _, _, h, w = inp.shape
+    reader = ImageCalibrationReader(calib_images[:n_calib], inp.name, h, w)
+    quantize_static(
+        str(fp32), str(out_path), reader, quant_format=QuantFormat.QDQ, per_channel=True,
+        weight_type=QuantType.QInt8, activation_type=QuantType.QInt8,
+    )
+    return out_path
+
+
+def build_int8(fold: Path, dest: Path, args) -> dict:
+    # kalibrasi hanya dari fold latih (bukan fold uji): folder dataset/train fold ini
+    imgs = sorted((fold / "dataset" / "train").glob("*.jpg")) + sorted((fold / "dataset" / "train").glob("*.png"))
+    num_classes = len(json.loads((fold / "classes.json").read_text(encoding="utf-8")))
+    out = export_int8(fold / "weights.pth", num_classes, imgs, dest / "model_int8.onnx", args.n_calib)
+    return {"onnx": out.name, "n_calib": min(args.n_calib, len(imgs))}
+
+
 def build_prune_unstructured(fold: Path, dest: Path, args) -> dict:
     return {"sparsity": prune_unstructured(fold / "weights.pth", dest / "weights.pth", args.prune_amount)}
 
 
-BUILDERS = {"prune_unstructured": build_prune_unstructured, "prune_structured": build_prune_structured}
+BUILDERS = {"int8": build_int8, "prune_unstructured": build_prune_unstructured, "prune_structured": build_prune_structured}
 
 
 def main(argv=None) -> None:
@@ -134,6 +187,7 @@ def main(argv=None) -> None:
     ap.add_argument("--prune-amount", type=float, default=0.5, help="sparsitas prune_unstructured")
     ap.add_argument("--structured-ratio", type=float, default=0.3, help="fraksi neuron FFN yang dibuang")
     ap.add_argument("--finetune-epochs", type=int, default=5)
+    ap.add_argument("--n-calib", type=int, default=100, help="gambar kalibrasi INT8")
     ap.add_argument("--smoke", action="store_true", help="1 fold")
     ap.add_argument("--out", type=Path, default=Path("outputs"))
     a = ap.parse_args(argv)
