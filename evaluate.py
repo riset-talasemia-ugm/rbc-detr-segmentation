@@ -688,7 +688,7 @@ def main(argv=None) -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--smoke", action="store_true", help="1 fold")
     ap.add_argument("--aug", choices=AUG_CHOICES, default="default", help="menentukan folder keluaran (sama dengan train.py)")
-    ap.add_argument("--kfold", choices=KFOLD_CHOICES, default="on", help="menentukan folder keluaran (sama dengan train.py; off: hanya fold 0)")
+    ap.add_argument("--kfold", choices=KFOLD_CHOICES, default="on", help="menentukan folder keluaran (sama dengan train.py; off: hold-out bawaan Roboflow, dievaluasi di split test)")
     ap.add_argument("--out", type=Path, default=None, help="default outputs (outputs_smoke untuk --smoke)")
     args = ap.parse_args(argv)
     if args.smoke or args.kfold == "off":

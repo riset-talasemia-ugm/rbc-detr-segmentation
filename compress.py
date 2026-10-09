@@ -203,7 +203,7 @@ def main(argv=None) -> None:
     ap.add_argument("--finetune-epochs", type=int, default=5)
     ap.add_argument("--n-calib", type=int, default=100, help="gambar kalibrasi INT8")
     ap.add_argument("--aug", choices=AUG_CHOICES, default="default", help="harus sama dengan train.py (fine-tune pruning memakai augmentasi yang sama)")
-    ap.add_argument("--kfold", choices=KFOLD_CHOICES, default="on", help="harus sama dengan train.py (off: hanya fold 0)")
+    ap.add_argument("--kfold", choices=KFOLD_CHOICES, default="on", help="harus sama dengan train.py (off: hold-out bawaan Roboflow)")
     ap.add_argument("--smoke", action="store_true", help="1 fold")
     ap.add_argument("--out", type=Path, default=None, help="default outputs (outputs_smoke untuk --smoke)")
     a = ap.parse_args(argv)

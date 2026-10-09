@@ -10,7 +10,7 @@ from PIL import Image
 from check_gpu import arch_supported
 from evaluate import _warm_cuda, measure_cost, ort_model_latency
 from evaluate import Instances, aggregate, panel_state, result_is_current, write_summary, coco_map, count_gflops, gt_instances, plot_confusion, remap_instances, save_panel, confusion_matrix, match_instances, load_predictor, summarize, to_instances
-from train import AUG_RBC, done_matches, drop_checkpoints, eta_line, fmt_duration, folds_by_filename, get_aug_config, make_settings, load_env, resolve_out, write_done, load_or_create_folds, make_folds, merge_coco, write_fold_dir
+from train import AUG_RBC, holdout_by_filename, holdout_split, load_or_create_holdout, done_matches, drop_checkpoints, eta_line, fmt_duration, folds_by_filename, get_aug_config, make_settings, load_env, resolve_out, write_done, load_or_create_folds, make_folds, merge_coco, write_fold_dir
 
 
 def synthetic_coco(n_images=10, class1_images=(0, 2, 4, 6, 8), with_empty=()):
@@ -681,6 +681,64 @@ def test_rbc_aug_is_accepted_and_keeps_boxes_and_masks_consistent():
             ys, xs = np.nonzero(m)
             assert ys.size == area  # flip/rot90 tidak mengubah luas mask
             assert abs(xs.min() - b[0]) <= 2 and abs(xs.max() + 1 - b[2]) <= 2 and abs(ys.min() - b[1]) <= 2 and abs(ys.max() + 1 - b[3]) <= 2
+
+
+def _roboflow_like(t: Path):
+    """Tiga split Roboflow kecil: train 4 gambar, valid 2, test 3 (id/nama file bertabrakan seperti dataset asli)."""
+    dirs = []
+    for name, n in (("train", 4), ("valid", 2), ("test", 3)):
+        _write_split(t / name, [f"{name}{i}.jpg" for i in range(n)], cat_id=0)
+        dirs.append(t / name)
+    return dirs
+
+
+def test_merge_records_split_and_holdout_split_follows_roboflow():
+    with tempfile.TemporaryDirectory() as t:
+        t = Path(t)
+        merged = merge_coco(_roboflow_like(t), t / "out")
+        assert {im["split"] for im in merged["images"]} == {"train", "valid", "test"}
+        sp = holdout_split(merged)
+        by_id = {im["id"]: im for im in merged["images"]}
+        assert [len(sp[k]) for k in ("train", "valid", "test")] == [4, 2, 3]
+        assert all(by_id[i]["split"] == "test" for i in sp["test"]) and all(by_id[i]["file_name"].startswith("train") for i in sp["train"])
+        no_test = {"images": [im for im in merged["images"] if im["split"] != "test"], "annotations": [], "categories": merged["categories"]}
+        try:
+            holdout_split(no_test)
+        except SystemExit as e:
+            assert "test" in str(e)
+        else:
+            raise AssertionError("tanpa split test harus ditolak dengan pesan jelas")
+
+
+def test_load_or_create_holdout_roundtrip_and_mismatch():
+    with tempfile.TemporaryDirectory() as t:
+        t = Path(t)
+        merged = merge_coco(_roboflow_like(t), t / "out")
+        p = t / "folds.json"
+        saved = load_or_create_holdout(merged, p)
+        assert saved["mode"] == "roboflow-split" and saved["k"] == 1 and len(saved["folds"]) == 1
+        assert saved["folds"][0] == holdout_split(merged)["test"]  # satu-satunya "fold" evaluasi = split test
+        assert saved["train_ids"] == holdout_split(merged)["train"] and saved["valid_ids"] == holdout_split(merged)["valid"]
+        assert load_or_create_holdout(merged, p) == saved
+        bigger = {**merged, "images": merged["images"] + [{**merged["images"][0], "id": 99}]}
+        try:
+            load_or_create_holdout(bigger, p)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("jumlah gambar berubah harus ditolak")
+
+
+def test_holdout_by_filename_lists_all_three_splits():
+    with tempfile.TemporaryDirectory() as t:
+        t = Path(t)
+        merged = merge_coco(_roboflow_like(t), t / "out")
+        saved = load_or_create_holdout(merged, t / "folds.json")
+        out = holdout_by_filename(merged, saved, ["a", "b"])
+        assert out["mode"] == "roboflow-split" and out["classes"] == ["a", "b"]
+        assert [len(out[k]) for k in ("train", "valid", "test")] == [4, 2, 3]
+        assert all(n.startswith("test") for n in out["test"]) and all(n.startswith("valid") for n in out["valid"])
+        json.dumps(out)
 
 
 if __name__ == "__main__":

@@ -134,7 +134,7 @@ def merge_coco(src_dirs: list[Path], out_dir: Path) -> dict:
             shutil.copy2(src / im["file_name"], images_out / name)
             new_id = len(merged["images"])
             id_map[im["id"]] = new_id
-            merged["images"].append({**im, "id": new_id, "file_name": name})
+            merged["images"].append({**im, "id": new_id, "file_name": name, "split": src.name})  # split asal Roboflow (train/valid/test)
         for a in coco["annotations"]:
             merged["annotations"].append({**a, "id": len(merged["annotations"]), "image_id": id_map[a["image_id"]]})
     (out_dir / ANN_NAME).write_text(json.dumps(merged), encoding="utf-8")
@@ -170,11 +170,17 @@ def make_folds(coco: dict, k: int, seed: int) -> list[list[int]]:
 
 def write_fold_dir(coco: dict, folds: list[list[int]], val_fold: int, images_dir: Path, out_dir: Path) -> Path:
     """Tulis out_dir/train (semua fold selain val_fold) dan out_dir/valid (val_fold), lengkap dengan gambar."""
+    train = [i for f, fi in enumerate(folds) if f != val_fold for i in fi]
+    return write_splits(coco, {"valid": folds[val_fold], "train": train}, images_dir, out_dir)
+
+
+def write_splits(coco: dict, splits: dict, images_dir: Path, out_dir: Path) -> Path:
+    """Tulis satu folder per split (nama -> id gambar) berisi gambar dan _annotations.coco.json (format Roboflow)."""
     out_dir = Path(out_dir)
     if out_dir.exists():
         shutil.rmtree(out_dir)
     by_id = {im["id"]: im for im in coco["images"]}
-    for split, ids in (("valid", folds[val_fold]), ("train", [i for f, fi in enumerate(folds) if f != val_fold for i in fi])):
+    for split, ids in splits.items():
         d = out_dir / split
         d.mkdir(parents=True)
         keep = set(ids)
@@ -187,6 +193,41 @@ def write_fold_dir(coco: dict, folds: list[list[int]], val_fold: int, images_dir
         }
         (d / ANN_NAME).write_text(json.dumps(sub), encoding="utf-8")
     return out_dir
+
+
+def holdout_split(coco: dict) -> dict:
+    """Pembagian bawaan Roboflow (train/valid/test) dari kunci 'split' hasil merge_coco: nama -> id gambar."""
+    out = {name: [im["id"] for im in coco["images"] if im.get("split") == name] for name in ("train", "valid", "test")}
+    for name in ("train", "valid", "test"):
+        if not out[name]:
+            raise SystemExit(f"--kfold off memakai split bawaan Roboflow, tetapi split '{name}' kosong atau tidak ada di dataset yang diunduh.")
+    return out
+
+
+def load_or_create_holdout(coco: dict, path: Path) -> dict:
+    """folds.json untuk hold-out bawaan Roboflow: satu 'fold' evaluasi = split test; berhenti bila jumlah gambar berubah."""
+    path = Path(path)
+    n = len(coco["images"])
+    if path.exists():
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        if saved.get("mode") != "roboflow-split" or saved.get("n_images") != n:
+            raise SystemExit(f"{path} bukan hold-out bawaan Roboflow dengan {n} gambar (isi: mode={saved.get('mode')}, {saved.get('n_images')} gambar). Hapus folder keluaran atau pakai --out lain.")
+        return saved
+    sp = holdout_split(coco)
+    saved = {"mode": "roboflow-split", "n_images": n, "k": 1, "seed": None, "folds": [sp["test"]], "train_ids": sp["train"], "valid_ids": sp["valid"]}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(saved), encoding="utf-8")
+    return saved
+
+
+def holdout_by_filename(coco: dict, saved: dict, class_names: list[str]) -> dict:
+    """Hold-out bawaan Roboflow sebagai nama file per split (train/valid/test) untuk dipakai kerangka kerja lain."""
+    name = {im["id"]: im["file_name"] for im in coco["images"]}
+    return {
+        "mode": "roboflow-split", "n_images": len(name), "classes": class_names,
+        "train": sorted(name[i] for i in saved["train_ids"]), "valid": sorted(name[i] for i in saved["valid_ids"]),
+        "test": sorted(name[i] for i in saved["folds"][0]),
+    }
 
 
 def load_or_create_folds(coco: dict, k: int, seed: int, path: Path) -> list[list[int]]:
@@ -246,23 +287,27 @@ def main(argv=None) -> None:
     ap.add_argument("--out", type=Path, default=None, help="default outputs (outputs_smoke untuk --smoke)")
     ap.add_argument("--data", type=Path, default=Path("data"))
     ap.add_argument("--aug", choices=AUG_CHOICES, default="default", help="augmentasi training: off (mati semua), default (flip horizontal saja, bawaan RF-DETR), rbc (mirip v7); folder keluaran terpisah")
-    ap.add_argument("--kfold", choices=KFOLD_CHOICES, default="on", help="on: cross-validation 5 fold; off: satu pembagian hold-out saja (fold 0, folder terpisah)")
+    ap.add_argument("--kfold", choices=KFOLD_CHOICES, default="on", help="on: cross-validation 5 fold; off: pembagian bawaan Roboflow (latih di train, pantau valid, evaluasi di test; folder terpisah)")
     ap.add_argument("--export-folds", action="store_true", help="tulis folds_by_filename.json dari <out>/folds.json lalu keluar (tanpa training)")
     a = ap.parse_args(argv)
     if a.smoke:
         a.folds, a.epochs = 1, 1
     if a.kfold == "off":
-        a.folds = 1  # hold-out: hanya fold 0 (pembagian yang sama dengan fold 0 run k-fold, jadi sebanding)
+        a.folds = 1  # hold-out bawaan Roboflow: satu evaluasi (split test)
     a.out = resolve_out(a.out, a.smoke, a.aug, a.kfold)
 
     if a.export_folds:  # tanpa .env/Roboflow/GPU: hanya butuh outputs/merged dan outputs/folds.json hasil run
         coco = json.loads((a.out / "merged" / ANN_NAME).read_text(encoding="utf-8"))
         saved = json.loads((a.out / "folds.json").read_text(encoding="utf-8"))
         names = {c["id"]: c["name"] for c in coco["categories"]}
-        exported = folds_by_filename(coco, saved["folds"], [names[c] for c in fold_classes(coco)], saved["seed"])
+        class_names = [names[c] for c in fold_classes(coco)]
+        if saved.get("mode") == "roboflow-split":  # hasil --kfold off
+            exported = holdout_by_filename(coco, saved, class_names)
+        else:
+            exported = folds_by_filename(coco, saved["folds"], class_names, saved["seed"])
         target = a.out / "folds_by_filename.json"
         target.write_text(json.dumps(exported, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"{target}: {exported['n_images']} gambar, {exported['k']} fold, kelas: {exported['classes']}")
+        print(f"{target}: {exported['n_images']} gambar, {exported.get('k', 'hold-out bawaan Roboflow')} fold, kelas: {exported['classes']}")
         return
 
     from dotenv import load_dotenv
@@ -278,7 +323,12 @@ def main(argv=None) -> None:
     merged = merge_coco(splits, a.out / "merged")
     annotated = {x["category_id"] for x in merged["annotations"]}
     print(f"{len(merged['images'])} gambar asli, {len(annotated)} kelas beranotasi (perkiraan: ~170 gambar, 13 kelas)")
-    folds = load_or_create_folds(merged, K, a.seed, a.out / "folds.json")
+    if a.kfold == "off":  # pembagian bawaan Roboflow: latih di train, pantau valid, evaluasi di test
+        holdout = load_or_create_holdout(merged, a.out / "folds.json")
+        folds = holdout["folds"]
+        print(f"hold-out bawaan Roboflow: train {len(holdout['train_ids'])} / valid {len(holdout['valid_ids'])} / test {len(folds[0])} gambar")
+    else:
+        folds = load_or_create_folds(merged, K, a.seed, a.out / "folds.json")
 
     from rfdetr import RFDETRSegSmall
 
@@ -294,7 +344,11 @@ def main(argv=None) -> None:
             raise SystemExit(f"{fold} dibuat dengan pengaturan lain ({(fold / 'DONE').read_text(encoding='utf-8')[:120]}), sekarang {settings}. Hapus folder itu atau pakai --out lain.")
         t0 = time.perf_counter()
         print(f"fold {k}: mulai ({len(durations) + 1} dari {pending} yang dijalankan)")
-        ds_dir = write_fold_dir(merged, folds, k, a.out / "merged" / "images", fold / "dataset")
+        images_dir = a.out / "merged" / "images"
+        if a.kfold == "off":
+            ds_dir = write_splits(merged, {"train": holdout["train_ids"], "valid": holdout["valid_ids"]}, images_dir, fold / "dataset")
+        else:
+            ds_dir = write_fold_dir(merged, folds, k, images_dir, fold / "dataset")
         train_coco = json.loads((ds_dir / "train" / ANN_NAME).read_text(encoding="utf-8"))
         (fold / "classes.json").write_text(json.dumps(fold_classes(train_coco)), encoding="utf-8")
         # Bobot terakhir (EMA akhir), bukan checkpoint_best_*: yang terbaik dipilih di fold valid sehingga skornya optimistis.

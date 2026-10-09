@@ -61,13 +61,13 @@ Annotations are expected in COCO instance format (polygon or RLE masks). Dataset
 | Switch | Values | Meaning |
 |---|---|---|
 | `--aug` | `off` / `default` / `rbc` | Training augmentation. `off`: none at all. `default`: RF-DETR's own default (horizontal flip only). `rbc`: approximates the old Roboflow v7 set (flip H/V, 90-degree rotation, hue/saturation/brightness, light blur and noise), applied per image during training. The dataset itself stays without augmentation so folds cannot leak. |
-| `--kfold` | `on` / `off` | `on`: 5-fold cross-validation. `off`: a single hold-out split (fold 0 only, the same split as fold 0 of the k-fold run), reported without a standard deviation. |
+| `--kfold` | `on` / `off` | `on`: 5-fold cross-validation over all images. `off`: the dataset's built-in Roboflow split (version 8: train 120 / valid 27 / test 23). Train on `train`, `valid` is only monitored (no checkpoint is selected on it), and the result is the single evaluation on `test` (no standard deviation). |
 | `--folds N` | integer | Run only the first N folds. |
 | `--smoke` | flag | 1 fold, 1 epoch, to check the whole path cheaply. |
 | `--variants` | names | `compress.py` / `evaluate.py` only: which variants to build or evaluate. |
 | `--n-visual`, `--cost-images` | integers | `evaluate.py`: number of comparison panels per fold, images used for the cost measurement. |
 
-Output folders: `outputs[_smoke][_off|_rbc][_holdout]`, for example `--smoke --aug rbc --no-kfold` writes to `outputs_smoke_rbc_holdout`. With `run_vast.sh`: `bash run_vast.sh --aug rbc`, `bash run_vast.sh --aug off --no-kfold`.
+Output folders: `outputs[_smoke][_off|_rbc][_holdout]`, for example `--smoke --aug rbc --no-kfold` writes to `outputs_smoke_rbc_holdout`. `python train.py --export-folds --kfold off` exports the built-in split as file names (`train`, `valid`, `test`). With `run_vast.sh`: `bash run_vast.sh --aug rbc`, `bash run_vast.sh --aug off --no-kfold`.
 
 ## Comparing other models (shared protocol)
 
