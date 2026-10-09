@@ -15,7 +15,7 @@ Annotations are expected in COCO instance format (polygon or RLE masks). Dataset
    cd rbc-detr-segmentation
    ```
 
-2. Install [uv](https://docs.astral.sh/uv/) once per machine, if you do not have it yet:
+2. Install [uv](https://docs.astral.sh/uv/) once per machine (only if needed):
 
    ```
    # Windows
