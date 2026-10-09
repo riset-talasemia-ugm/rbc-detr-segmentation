@@ -16,6 +16,8 @@ from typing import Protocol
 
 import numpy as np
 
+from train import resolve_out
+
 
 @dataclass
 class Instances:
@@ -357,6 +359,8 @@ def measure_cost(predictor, images: list, warmup: int = 10, n: int = 100, thresh
         raise ValueError("tidak ada gambar untuk mengukur biaya komputasi")
     seq = [imgs[i % len(imgs)] for i in range(warmup + n)]
     sync = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     for im in seq[:warmup]:
         predictor.predict(im, threshold)
     times = []
@@ -371,6 +375,7 @@ def measure_cost(predictor, images: list, warmup: int = 10, n: int = 100, thresh
         "latency_ms_mean": float(np.mean(times)), "latency_ms_p50": float(np.percentile(times, 50)),
         "latency_ms_p95": float(np.percentile(times, 95)), "fps": 1000 / float(np.mean(times)),
         "gpu_mem_peak_mb": gpu.peak_mb, "gpu_util_mean_pct": gpu.util_mean,
+        "torch_peak_alloc_mb": torch.cuda.max_memory_allocated() / 2**20 if torch.cuda.is_available() else None,
     }
 
 
@@ -391,6 +396,37 @@ def count_gflops(module, resolution: int) -> float:
 VARIANTS = ["fp32", "fp16", "int8", "prune_unstructured", "prune_structured"]
 LOW_THR = 0.01  # threshold prediksi mentah untuk mAP; pencocokan/confusion memakai --threshold
 METRIC_KEYS = ["map50_95", "map50", "precision_micro", "recall_micro", "f1_micro", "precision_macro", "recall_macro", "f1_macro", "accuracy_detection", "accuracy_classification"]
+
+
+def result_is_current(result: dict | None, stamp: dict, need_cost: bool) -> bool:
+    """Hasil lama boleh dilewati hanya bila ok, dibuat dengan pengaturan yang sama, dan (fold 0) biayanya terukur tanpa error."""
+    if not result or result.get("status") != "ok" or result.get("stamp") != stamp:
+        return False
+    return not need_cost or ("cost" in result and "cost_error" not in result)
+
+
+def panel_state(status: str | None, has_npz: bool) -> str:
+    """Kolom panel varian: 'show' (ada prediksi), 'failed' (varian GAGAL), 'skip' (belum dijalankan / gambar visual berubah)."""
+    if status == "ok":
+        return "show" if has_npz else "skip"
+    return "failed" if status == "GAGAL" else "skip"
+
+
+def _gpu_used_mb():
+    """Memori GPU 0 terpakai saat ini (MB, seluruh perangkat) atau None tanpa GPU/pynvml."""
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            return pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(0)).used / 2**20
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+LATENCY_SCOPE = "predict() ujung-ke-ujung (preprocess+inferensi+postprocess); int8: preprocess dan mask upsampling berjalan di CPU, torch fp32/fp16 di GPU"
 
 
 def load_context(out: Path) -> dict:
@@ -438,11 +474,13 @@ def artifact_problem(variant: str, fold_dir: Path) -> str | None:
     return None if (vd / "DONE").exists() else f"{vd}/DONE tidak ada (jalankan compress.py)"
 
 
-def variant_cost(variant: str, pred, fold_dir: Path, image_paths: list, out: Path, n: int) -> dict:
+def variant_cost(variant: str, pred, fold_dir: Path, image_paths: list, n: int, baseline_mb) -> dict:
     """Biaya komputasi satu varian (fold 0): latency/FPS/GPU, GFLOPs, ukuran model, parameter."""
     import torch
 
     cost = measure_cost(pred, image_paths, n=n)
+    peak = cost["gpu_mem_peak_mb"]  # memori seluruh perangkat; dikurangi baseline sebelum model dimuat agar sebanding antar varian
+    cost["gpu_mem_over_baseline_mb"] = peak - baseline_mb if peak is not None and baseline_mb is not None else None
     wp = weights_path(variant, fold_dir)
     cost["file_mb"] = wp.stat().st_size / 2**20
     if variant == "int8":
@@ -450,12 +488,11 @@ def variant_cost(variant: str, pred, fold_dir: Path, image_paths: list, out: Pat
 
         cost["params"] = int(sum(int(np.prod(i.dims)) for i in onnx.load(str(wp)).graph.initializer))
         cost["nonzero_params"] = None
+        cost["torch_peak_alloc_mb"] = None  # tidak memakai alokator torch
         cost["provider"] = ",".join(pred.providers)
         cost["gflops"], cost["gflops_note"] = None, "sama dengan fp32 (jumlah operasi tidak berubah)"
-    elif variant == "fp16":  # inference(inplace=True) mengosongkan modul PyTorch: angka arsitektur diambil dari fp32
-        base = _fp32_cost(out)
-        cost["params"], cost["nonzero_params"] = base.get("params"), base.get("nonzero_params")
-        cost["file_mb"] = cost["params"] * 2 / 2**20 if cost["params"] else None  # bobot fp16 = 2 byte/parameter
+    elif variant == "fp16":  # inference(inplace=True) mengosongkan modul PyTorch: params/file_mb/gflops diisi dari fp32 di write_summary
+        cost["params"] = cost["nonzero_params"] = cost["file_mb"] = None
         cost["provider"] = "cuda" if torch.cuda.is_available() else "cpu"
         cost["gflops"], cost["gflops_note"] = None, "sama dengan fp32 (jumlah operasi tidak berubah)"
     else:
@@ -469,14 +506,7 @@ def variant_cost(variant: str, pred, fold_dir: Path, image_paths: list, out: Pat
             cost["gflops"], cost["gflops_note"] = None, "sama dengan fp32 (jumlah operasi tidak berubah)"
     if variant == "prune_unstructured":
         cost["sparsity_pct"] = 100 * json.loads((fold_dir / "variants" / variant / "info.json").read_text(encoding="utf-8"))["sparsity"]
-    if cost["gflops"] is None:  # salin dari fp32 bila tersedia
-        cost["gflops"] = _fp32_cost(out).get("gflops")
     return cost
-
-
-def _fp32_cost(out: Path) -> dict:
-    f32 = out / "results" / "fp32" / "fold0.json"
-    return json.loads(f32.read_text(encoding="utf-8")).get("cost", {}) if f32.exists() else {}
 
 
 def evaluate_variant_fold(variant: str, k: int, ctx: dict, args) -> dict:
@@ -488,6 +518,14 @@ def evaluate_variant_fold(variant: str, k: int, ctx: dict, args) -> dict:
     classes_k = json.loads((fold_dir / "classes.json").read_text(encoding="utf-8"))
     label_to_global = {lab: ctx["cat_to_global"][cat] for lab, cat in enumerate(classes_k)}
     C = len(ctx["global_cats"])
+    import gc
+
+    import torch
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    baseline_mb = _gpu_used_mb()  # sebelum model dimuat
     pred = load_predictor(variant, fold_dir, len(classes_k))
     cm, coco_preds = np.zeros((C + 1, C + 1), int), []
     chosen = set(vis_ids(ctx["folds"][k], k, args.seed, args.n_visual))
@@ -516,7 +554,7 @@ def evaluate_variant_fold(variant: str, k: int, ctx: dict, args) -> dict:
     if k == 0:
         paths = [ctx["images_dir"] / ctx["images"][i]["file_name"] for i in ctx["folds"][0]]
         try:  # kegagalan pengukuran biaya tidak boleh membuang metrik yang sudah dihitung
-            result["cost"] = variant_cost(variant, pred, fold_dir, paths, args.out, args.cost_images)
+            result["cost"] = variant_cost(variant, pred, fold_dir, paths, args.cost_images, baseline_mb)
         except Exception as e:  # noqa: BLE001
             result["cost_error"] = f"{type(e).__name__}: {e}"
             print(f"{variant}: biaya komputasi gagal diukur ({result['cost_error']})")
@@ -524,7 +562,9 @@ def evaluate_variant_fold(variant: str, k: int, ctx: dict, args) -> dict:
 
 
 def write_summary(args, ctx: dict, variants: list[str]) -> Path:
-    """summary.csv (mean +- std antar fold, biaya komputasi) dan confusion matrix gabungan per varian."""
+    """summary.csv (mean +- std antar fold, metrik gabungan, biaya komputasi), confusion matrix gabungan dan per_class.csv per varian."""
+    f32 = args.out / "results" / "fp32" / "fold0.json"
+    base = json.loads(f32.read_text(encoding="utf-8")).get("cost", {}) if f32.exists() else {}
     rows = []
     for v in variants:
         files = sorted((args.out / "results" / v).glob("fold*.json"))
@@ -538,12 +578,32 @@ def write_summary(args, ctx: dict, variants: list[str]) -> Path:
         row.update(status="ok" if len(ok) == args.folds else f"parsial {len(ok)}/{args.folds}", folds_ok=len(ok))
         for key, (mean, std) in aggregate([r["metrics"] for r in ok]).items():
             row[f"{key}_mean"], row[f"{key}_std"] = mean, std
-        row.update({k: val for k, val in next((r["cost"] for r in ok if "cost" in r), {}).items()})
+        cost = dict(next((r["cost"] for r in ok if "cost" in r), {}))
+        if cost:
+            if cost.get("gflops") is None:  # jumlah operasi sama dengan fp32
+                cost["gflops"] = base.get("gflops")
+            if v == "fp16":  # modul PyTorch fp16 dikosongkan saat optimasi; parameter sama dengan fp32, bobot 2 byte/parameter
+                cost["params"], cost["nonzero_params"] = base.get("params"), base.get("nonzero_params")
+                cost["file_mb"] = cost["params"] * 2 / 2**20 if cost["params"] else None
+            cost["latency_scope"] = LATENCY_SCOPE
+        row.update(cost)
         err = next((r["cost_error"] for r in ok if "cost_error" in r), None)
         if err:
             row["cost_error"] = err
         pooled = np.sum([np.array(r["cm"]) for r in ok], axis=0)
+        ps = summarize(pooled)
+        for key in METRIC_KEYS:
+            if key in ps:
+                row[f"pooled_{key}"] = ps[key]
         plot_confusion(pooled, ctx["class_names"], args.out / "results" / v / "confusion.png")
+        cats = ctx["global_cats"]
+        ap_agg = aggregate([{c: r["ap_per_class"].get(str(c), float("nan")) for c in cats} for r in ok])
+        with open(args.out / "results" / v / "per_class.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["class", "category_id", "ap_mean", "ap_std", "precision", "recall", "f1"])
+            for i, (name, c) in enumerate(zip(ctx["class_names"], cats)):
+                pcs = ps["per_class"][i]
+                w.writerow([name, c, ap_agg[c][0], ap_agg[c][1], pcs["precision"], pcs["recall"], pcs["f1"]])
         rows.append(row)
     cols = list(dict.fromkeys(k for r in rows for k in r))
     path = args.out / "results" / "summary.csv"
@@ -567,11 +627,13 @@ def make_panels(args, ctx: dict, variants: list[str]) -> int:
             preds = {}
             for v in variants:
                 f = args.out / "results" / v / "vis" / f"fold{k}_img{img_id}.npz"
-                if f.exists():
+                rf = args.out / "results" / v / f"fold{k}.json"
+                state = panel_state(json.loads(rf.read_text(encoding="utf-8"))["status"] if rf.exists() else None, f.exists())
+                if state == "show":
                     d = np.load(f)
                     preds[v] = Instances(d["masks"], d["class_id"], d["score"])
-                elif (args.out / "results" / v / f"fold{k}.json").exists():
-                    preds[v] = None  # varian dijalankan tetapi gagal
+                elif state == "failed":
+                    preds[v] = None
             if preds:
                 save_panel(image, gt_instances(ctx["api"], img_id, ctx["cat_to_global"], size), preds, args.out / "results" / "panels" / f"fold{k}_img{img_id}.png")
                 n += 1
@@ -587,10 +649,11 @@ def main(argv=None) -> None:
     ap.add_argument("--cost-images", type=int, default=100)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--smoke", action="store_true", help="1 fold")
-    ap.add_argument("--out", type=Path, default=Path("outputs"))
+    ap.add_argument("--out", type=Path, default=None, help="default outputs (outputs_smoke untuk --smoke)")
     args = ap.parse_args(argv)
     if args.smoke:
         args.folds = 1
+    args.out = resolve_out(args.out, args.smoke)
     import gc
 
     import torch
@@ -601,7 +664,12 @@ def main(argv=None) -> None:
     for v in args.variants:
         for k in range(args.folds):
             rp = args.out / "results" / v / f"fold{k}.json"
-            if rp.exists() and json.loads(rp.read_text(encoding="utf-8"))["status"] == "ok":
+            fd = args.out / f"fold{k}"
+            read = lambda path: path.read_text(encoding="utf-8") if path.exists() else ""  # noqa: E731
+            stamp = {"threshold": args.threshold, "seed": args.seed, "n_visual": args.n_visual, "cost_images": args.cost_images,
+                     "fold_done": read(fd / "DONE"), "variant_done": read(fd / "variants" / v / "DONE")}
+            existing = json.loads(rp.read_text(encoding="utf-8")) if rp.exists() else None
+            if result_is_current(existing, stamp, need_cost=(k == 0)):
                 print(f"{v} fold {k}: sudah ada, dilewati")
                 continue
             try:
@@ -613,12 +681,17 @@ def main(argv=None) -> None:
             except Exception as e:  # noqa: BLE001 - varian gagal ditandai, varian lain tetap jalan
                 result = {"status": "GAGAL", "fold": k, "reason": f"{type(e).__name__}: {e}"}
                 print(f"{v} fold {k}: GAGAL ({result['reason']})")
+            result["stamp"] = stamp
             rp.parent.mkdir(parents=True, exist_ok=True)
             rp.write_text(json.dumps(result), encoding="utf-8")
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-    print("ringkasan:", write_summary(args, ctx, args.variants), "| panel:", make_panels(args, ctx, args.variants))
+    summary = write_summary(args, ctx, args.variants)
+    print("ringkasan:", summary, "| panel:", make_panels(args, ctx, args.variants))
+    bad = [r["variant"] for r in csv.DictReader(open(summary, encoding="utf-8")) if r["status"] != "ok"]
+    if bad:  # skrip tetap keluar 0 (varian lain valid), tetapi hasilnya jangan dipakai tanpa memeriksa ini
+        print(f"PERINGATAN: varian dengan status bukan ok: {bad}. Periksa summary.csv sebelum memakai hasil.")
 
 
 if __name__ == "__main__":

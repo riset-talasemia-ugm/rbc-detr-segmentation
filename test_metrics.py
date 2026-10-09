@@ -7,8 +7,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from evaluate import Instances, aggregate, coco_map, count_gflops, gt_instances, plot_confusion, remap_instances, save_panel, confusion_matrix, match_instances, load_predictor, summarize, to_instances
-from train import load_env, load_or_create_folds, make_folds, merge_coco, write_fold_dir
+from evaluate import Instances, aggregate, panel_state, result_is_current, write_summary, coco_map, count_gflops, gt_instances, plot_confusion, remap_instances, save_panel, confusion_matrix, match_instances, load_predictor, summarize, to_instances
+from train import done_matches, load_env, resolve_out, write_done, load_or_create_folds, make_folds, merge_coco, write_fold_dir
 
 
 def synthetic_coco(n_images=10, class1_images=(0, 2, 4, 6, 8), with_empty=()):
@@ -457,6 +457,69 @@ def test_count_gflops_on_real_model_and_pruning_reduces_it():
     assert 10 < full < 500, full  # RFDETRSegSmall ~63 GFLOPs pada 384
     prune_ffn(m.model.model, 0.3)
     assert count_gflops(m.model.model, res) < full  # pruning terstruktur benar-benar menurunkan GFLOPs
+
+
+def test_resolve_out_keeps_smoke_apart_from_full_run():
+    assert resolve_out(None, smoke=False) == Path("outputs")
+    assert resolve_out(None, smoke=True) == Path("outputs_smoke")  # smoke tidak boleh menimpa/dipakai ulang oleh run penuh
+    assert resolve_out(Path("x"), smoke=True) == Path("x")  # --out eksplisit selalu menang
+
+
+def test_done_stamp_matches_only_identical_settings():
+    with tempfile.TemporaryDirectory() as t:
+        p = Path(t) / "DONE"
+        assert not done_matches(p, {"epochs": 50})  # belum ada
+        write_done(p, {"epochs": 50, "seed": 0})
+        assert done_matches(p, {"epochs": 50, "seed": 0})
+        assert not done_matches(p, {"epochs": 1, "seed": 0})  # pengaturan beda (mis. smoke 1 epoch)
+        p.write_text("ok")  # penanda lama tanpa stempel
+        assert not done_matches(p, {"epochs": 50, "seed": 0})
+
+
+def test_result_is_current_requires_same_stamp_and_clean_cost():
+    stamp = {"threshold": 0.5, "seed": 0}
+    ok = {"status": "ok", "stamp": stamp, "cost": {"fps": 1.0}}
+    assert result_is_current(ok, stamp, need_cost=True)
+    assert not result_is_current(None, stamp, need_cost=False)
+    assert not result_is_current({**ok, "stamp": {"threshold": 0.3, "seed": 0}}, stamp, need_cost=False)  # pengaturan berubah
+    assert not result_is_current({"status": "GAGAL", "stamp": stamp}, stamp, need_cost=False)
+    assert not result_is_current({"status": "ok", "stamp": stamp}, stamp, need_cost=True)  # fold 0 tanpa biaya diukur ulang
+    assert not result_is_current({**ok, "cost_error": "boom"}, stamp, need_cost=True)
+    assert result_is_current({"status": "ok", "stamp": stamp}, stamp, need_cost=False)  # fold > 0 tidak butuh biaya
+
+
+def test_panel_state():
+    assert panel_state("ok", True) == "show"
+    assert panel_state("ok", False) == "skip"  # gambar visual berubah (seed/n_visual): bukan kegagalan varian
+    assert panel_state("GAGAL", False) == "failed"
+    assert panel_state(None, False) == "skip"  # varian belum dijalankan
+
+
+def test_write_summary_pooled_per_class_and_fp32_cost_copy():
+    import csv
+    from types import SimpleNamespace
+
+    def res(cm, cost=None):
+        m = {k: 0.5 for k in ("map50_95", "map50", "precision_micro", "recall_micro", "f1_micro", "precision_macro", "recall_macro", "f1_macro", "accuracy_detection", "accuracy_classification")}
+        r = {"status": "ok", "fold": 0, "cm": cm, "metrics": m, "ap_per_class": {"1": 0.5, "2": 0.25}}
+        if cost is not None:
+            r["cost"] = cost
+        return r
+
+    cm = [[2, 0, 1], [0, 1, 1], [1, 0, 0]]
+    with tempfile.TemporaryDirectory() as t:
+        out = Path(t)
+        for v, cost in (("fp32", {"gflops": 62.0, "params": 100, "nonzero_params": 90, "fps": 2.0}), ("fp16", {"gflops": None, "params": None, "nonzero_params": None, "fps": 4.0})):
+            (out / "results" / v).mkdir(parents=True)
+            (out / "results" / v / "fold0.json").write_text(json.dumps(res(cm, cost)))
+        ctx = {"class_names": ["a", "b"], "global_cats": [1, 2]}
+        path = write_summary(SimpleNamespace(out=out, folds=1), ctx, ["fp32", "fp16"])
+        rows = {r["variant"]: r for r in csv.DictReader(open(path, encoding="utf-8"))}
+        assert float(rows["fp16"]["gflops"]) == 62.0 and float(rows["fp16"]["params"]) == 100.0  # disalin dari fp32
+        assert "latency_scope" in rows["fp16"]  # catatan cakupan latency (end-to-end predict())
+        assert abs(float(rows["fp32"]["pooled_precision_micro"]) - 3 / 4) < 1e-9  # TP=3, FP=1 dari cm gabungan
+        pc = list(csv.DictReader(open(out / "results" / "fp32" / "per_class.csv", encoding="utf-8")))
+        assert [r["class"] for r in pc] == ["a", "b"] and abs(float(pc[0]["ap_mean"]) - 0.5) < 1e-9
 
 
 if __name__ == "__main__":

@@ -12,6 +12,24 @@ K = 5  # jumlah fold; --folds hanya membatasi berapa fold yang dijalankan
 ENV_VARS = ("ROBOFLOW_API_KEY", "ROBOFLOW_WORKSPACE", "ROBOFLOW_PROJECT", "ROBOFLOW_VERSION")
 
 
+def resolve_out(out, smoke: bool) -> Path:
+    """Folder keluaran: --out eksplisit; bila tidak, smoke memakai outputs_smoke agar tidak bercampur dengan run penuh."""
+    return Path(out) if out else Path("outputs_smoke" if smoke else "outputs")
+
+
+def write_done(path: Path, settings: dict) -> None:
+    """Penanda selesai yang memuat pengaturan penghasilnya (epoch, seed, parameter kompresi, ...)."""
+    Path(path).write_text(json.dumps(settings, sort_keys=True), encoding="utf-8")
+
+
+def done_matches(path: Path, settings: dict) -> bool:
+    """True bila penanda ada dan dibuat dengan pengaturan yang sama persis; penanda lama/rusak dianggap tidak cocok."""
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8")) == json.loads(json.dumps(settings, sort_keys=True))
+    except (OSError, ValueError):
+        return False
+
+
 def load_env(environ=None) -> dict:
     """Baca kredensial Roboflow dari environment; berhenti dengan pesan jelas bila ada yang kosong."""
     environ = os.environ if environ is None else environ
@@ -147,11 +165,12 @@ def main(argv=None) -> None:
     ap.add_argument("--folds", type=int, default=K, help="jalankan hanya N fold pertama (dari K=5)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--smoke", action="store_true", help="1 fold, 1 epoch")
-    ap.add_argument("--out", type=Path, default=Path("outputs"))
+    ap.add_argument("--out", type=Path, default=None, help="default outputs (outputs_smoke untuk --smoke)")
     ap.add_argument("--data", type=Path, default=Path("data"))
     a = ap.parse_args(argv)
     if a.smoke:
         a.folds, a.epochs = 1, 1
+    a.out = resolve_out(a.out, a.smoke)
 
     from dotenv import load_dotenv
 
@@ -172,16 +191,19 @@ def main(argv=None) -> None:
 
     for k in range(min(a.folds, K)):
         fold = a.out / f"fold{k}"
-        if (fold / "DONE").exists():
+        settings = {"epochs": a.epochs, "seed": a.seed, "k": K, "version": env["version"]}
+        if done_matches(fold / "DONE", settings):
             print(f"fold {k}: sudah selesai, dilewati")
             continue
+        if (fold / "DONE").exists():  # jangan menimpa/memakai ulang hasil yang dibuat dengan pengaturan lain
+            raise SystemExit(f"{fold} dibuat dengan pengaturan lain ({(fold / 'DONE').read_text(encoding='utf-8')[:120]}), sekarang {settings}. Hapus folder itu atau pakai --out lain.")
         ds_dir = write_fold_dir(merged, folds, k, a.out / "merged" / "images", fold / "dataset")
         train_coco = json.loads((ds_dir / "train" / ANN_NAME).read_text(encoding="utf-8"))
         (fold / "classes.json").write_text(json.dumps(fold_classes(train_coco)), encoding="utf-8")
         # Bobot terakhir (EMA akhir), bukan checkpoint_best_*: yang terbaik dipilih di fold valid sehingga skornya optimistis.
         RFDETRSegSmall().train(dataset_dir=str(ds_dir), epochs=a.epochs, batch_size="auto", lr=1e-4, output_dir=str(fold / "run"))
         shutil.copy2(fold / "run" / "last_ema.pth", fold / "weights.pth")
-        (fold / "DONE").write_text("ok")
+        write_done(fold / "DONE", settings)
         print(f"fold {k}: selesai")
 
 

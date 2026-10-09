@@ -5,6 +5,8 @@ import shutil
 import traceback
 from pathlib import Path
 
+from train import done_matches, resolve_out, write_done
+
 try:
     from onnxruntime.quantization import CalibrationDataReader as _ReaderBase
 except ImportError:  # onnxruntime tidak terpasang: hanya int8 yang butuh
@@ -180,6 +182,13 @@ def build_prune_unstructured(fold: Path, dest: Path, args) -> dict:
 BUILDERS = {"int8": build_int8, "prune_unstructured": build_prune_unstructured, "prune_structured": build_prune_structured}
 
 
+VARIANT_SETTINGS = {
+    "int8": lambda a: {"n_calib": a.n_calib},
+    "prune_unstructured": lambda a: {"prune_amount": a.prune_amount},
+    "prune_structured": lambda a: {"structured_ratio": a.structured_ratio, "finetune_epochs": a.finetune_epochs},
+}
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--variants", nargs="+", default=list(BUILDERS), choices=list(BUILDERS))
@@ -189,25 +198,29 @@ def main(argv=None) -> None:
     ap.add_argument("--finetune-epochs", type=int, default=5)
     ap.add_argument("--n-calib", type=int, default=100, help="gambar kalibrasi INT8")
     ap.add_argument("--smoke", action="store_true", help="1 fold")
-    ap.add_argument("--out", type=Path, default=Path("outputs"))
+    ap.add_argument("--out", type=Path, default=None, help="default outputs (outputs_smoke untuk --smoke)")
     a = ap.parse_args(argv)
     if a.smoke:
         a.folds = 1
+    a.out = resolve_out(a.out, a.smoke)
     for k in range(a.folds):
         fold = a.out / f"fold{k}"
         if not (fold / "DONE").exists():
             raise SystemExit(f"{fold}/DONE tidak ada: jalankan train.py dulu.")
         for v in a.variants:
             dest = fold / "variants" / v
-            if (dest / "DONE").exists():
+            # stempel: pengaturan varian + penanda fold (jika fold dilatih ulang, varian dibuat ulang)
+            settings = {"fold": (fold / "DONE").read_text(encoding="utf-8"), **VARIANT_SETTINGS[v](a)}
+            if done_matches(dest / "DONE", settings):
                 print(f"fold {k} {v}: sudah ada, dilewati")
                 continue
+            (dest / "DONE").unlink(missing_ok=True)
             dest.mkdir(parents=True, exist_ok=True)
             (dest / "FAILED.txt").unlink(missing_ok=True)
             try:
                 info = BUILDERS[v](fold, dest, a)
                 (dest / "info.json").write_text(json.dumps(info), encoding="utf-8")
-                (dest / "DONE").write_text("ok")
+                write_done(dest / "DONE", settings)
                 print(f"fold {k} {v}: selesai {info}")
             except Exception as e:  # noqa: BLE001 - varian gagal ditandai, varian lain tetap jalan
                 (dest / "FAILED.txt").write_text(f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}", encoding="utf-8")
