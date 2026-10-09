@@ -10,7 +10,7 @@ from PIL import Image
 from check_gpu import arch_supported
 from evaluate import _warm_cuda, measure_cost, ort_model_latency
 from evaluate import Instances, aggregate, panel_state, result_is_current, write_summary, coco_map, count_gflops, gt_instances, plot_confusion, remap_instances, save_panel, confusion_matrix, match_instances, load_predictor, summarize, to_instances
-from train import done_matches, drop_checkpoints, eta_line, fmt_duration, load_env, resolve_out, write_done, load_or_create_folds, make_folds, merge_coco, write_fold_dir
+from train import done_matches, drop_checkpoints, eta_line, fmt_duration, folds_by_filename, load_env, resolve_out, write_done, load_or_create_folds, make_folds, merge_coco, write_fold_dir
 
 
 def synthetic_coco(n_images=10, class1_images=(0, 2, 4, 6, 8), with_empty=()):
@@ -604,6 +604,18 @@ def test_eta_line_uses_mean_of_finished_units():
     assert eta_line([1800, 2400], remaining=3) == "selesai dalam 40 menit; perkiraan sisa 1 jam 45 menit"
     assert eta_line([60], remaining=0) == "selesai dalam 1 menit"  # tidak ada sisa: tanpa perkiraan
     assert eta_line([], remaining=2) == ""  # belum ada data
+
+
+def test_folds_by_filename_partitions_all_images_with_class_names():
+    coco = synthetic_coco()
+    folds = make_folds(coco, k=5, seed=0)
+    out = folds_by_filename(coco, folds, ["a", "b"], seed=0)
+    assert out["k"] == 5 and out["seed"] == 0 and out["n_images"] == 10 and out["classes"] == ["a", "b"]
+    names = [n for f in out["folds"] for n in f]
+    assert sorted(names) == sorted(im["file_name"] for im in coco["images"])  # tiap gambar tepat di satu fold
+    by_id = {im["id"]: im["file_name"] for im in coco["images"]}
+    assert [sorted(by_id[i] for i in f) for f in folds] == out["folds"]  # sama dengan folds.json, hanya nama file
+    json.dumps(out)  # bisa diserialisasi
 
 
 if __name__ == "__main__":

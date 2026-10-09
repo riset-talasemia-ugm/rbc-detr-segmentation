@@ -181,6 +181,15 @@ def download_dataset(env: dict, dest: Path) -> list[Path]:
     return [d for d in (Path(ds.location) / s for s in ("train", "valid", "test")) if (d / ANN_NAME).exists()]
 
 
+def folds_by_filename(coco: dict, folds: list[list[int]], class_names: list[str], seed: int) -> dict:
+    """Pembagian fold sebagai nama file (bukan nomor gambar internal) agar bisa dipakai kerangka kerja lain (YOLO, dst.)."""
+    name = {im["id"]: im["file_name"] for im in coco["images"]}
+    return {
+        "n_images": len(name), "k": len(folds), "seed": seed, "classes": class_names,
+        "folds": [sorted(name[i] for i in f) for f in folds],
+    }
+
+
 def fold_classes(train_coco: dict) -> list[int]:
     """category_id dalam urutan label rfdetr (kategori beranotasi, tanpa kategori induk) untuk split train ini."""
     from rfdetr.datasets.coco import annotated_category_ids, filter_parent_categories
@@ -197,10 +206,21 @@ def main(argv=None) -> None:
     ap.add_argument("--smoke", action="store_true", help="1 fold, 1 epoch")
     ap.add_argument("--out", type=Path, default=None, help="default outputs (outputs_smoke untuk --smoke)")
     ap.add_argument("--data", type=Path, default=Path("data"))
+    ap.add_argument("--export-folds", action="store_true", help="tulis folds_by_filename.json dari <out>/folds.json lalu keluar (tanpa training)")
     a = ap.parse_args(argv)
     if a.smoke:
         a.folds, a.epochs = 1, 1
     a.out = resolve_out(a.out, a.smoke)
+
+    if a.export_folds:  # tanpa .env/Roboflow/GPU: hanya butuh outputs/merged dan outputs/folds.json hasil run
+        coco = json.loads((a.out / "merged" / ANN_NAME).read_text(encoding="utf-8"))
+        saved = json.loads((a.out / "folds.json").read_text(encoding="utf-8"))
+        names = {c["id"]: c["name"] for c in coco["categories"]}
+        exported = folds_by_filename(coco, saved["folds"], [names[c] for c in fold_classes(coco)], saved["seed"])
+        target = a.out / "folds_by_filename.json"
+        target.write_text(json.dumps(exported, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"{target}: {exported['n_images']} gambar, {exported['k']} fold, kelas: {exported['classes']}")
+        return
 
     from dotenv import load_dotenv
 
