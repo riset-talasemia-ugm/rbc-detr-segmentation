@@ -159,6 +159,11 @@ class OrtPredictor:
     def __init__(self, name: str, onnx_path: Path):
         import onnxruntime as ort
 
+        if hasattr(ort, "preload_dlls"):  # ORT >= 1.21: muat pustaka CUDA/cuDNN dari paket pip torch/nvidia
+            try:
+                ort.preload_dlls()
+            except Exception:  # noqa: BLE001 - tanpa GPU/pustaka: biarkan CPU EP
+                pass
         want = [p for p in ("TensorrtExecutionProvider", "CUDAExecutionProvider") if p in ort.get_available_providers()]
         want = [p for p in want if p != "TensorrtExecutionProvider"]  # TensorRT EP membangun engine saat pertama jalan; pakai CUDA EP
         self.name = name
