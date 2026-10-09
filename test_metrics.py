@@ -10,7 +10,7 @@ from PIL import Image
 from check_gpu import arch_supported
 from evaluate import _warm_cuda, measure_cost, ort_model_latency
 from evaluate import Instances, aggregate, panel_state, result_is_current, write_summary, coco_map, count_gflops, gt_instances, plot_confusion, remap_instances, save_panel, confusion_matrix, match_instances, load_predictor, summarize, to_instances
-from train import done_matches, drop_checkpoints, load_env, resolve_out, write_done, load_or_create_folds, make_folds, merge_coco, write_fold_dir
+from train import done_matches, drop_checkpoints, eta_line, fmt_duration, load_env, resolve_out, write_done, load_or_create_folds, make_folds, merge_coco, write_fold_dir
 
 
 def synthetic_coco(n_images=10, class1_images=(0, 2, 4, 6, 8), with_empty=()):
@@ -587,6 +587,23 @@ def test_ort_model_latency_on_tiny_onnx():
         onnx.save(model, str(p))
         ms = ort_model_latency(p, warmup=1, n=3)
     assert 0 < ms < 5000  # milidetik per session.run; hanya model, tanpa pre/pascaproses
+
+
+def test_fmt_duration_units():
+    assert fmt_duration(45) == "45 detik"
+    assert fmt_duration(60) == "1 menit"
+    assert fmt_duration(125) == "2 menit"
+    assert fmt_duration(2400) == "40 menit"
+    assert fmt_duration(4320) == "1 jam 12 menit"
+    assert fmt_duration(7200) == "2 jam"
+    assert fmt_duration(0.4) == "0 detik"
+
+
+def test_eta_line_uses_mean_of_finished_units():
+    # dua fold selesai (30 dan 40 menit), 3 tersisa: rata-rata 35 menit x 3 = 105 menit
+    assert eta_line([1800, 2400], remaining=3) == "selesai dalam 40 menit; perkiraan sisa 1 jam 45 menit"
+    assert eta_line([60], remaining=0) == "selesai dalam 1 menit"  # tidak ada sisa: tanpa perkiraan
+    assert eta_line([], remaining=2) == ""  # belum ada data
 
 
 if __name__ == "__main__":

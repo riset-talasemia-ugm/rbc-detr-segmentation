@@ -16,7 +16,7 @@ from typing import Protocol
 
 import numpy as np
 
-from train import resolve_out
+from train import fmt_duration, resolve_out
 
 
 @dataclass
@@ -715,8 +715,9 @@ def main(argv=None) -> None:
                 problem = artifact_problem(v, args.out / f"fold{k}")
                 if problem:
                     raise RuntimeError(problem)
+                t0 = time.perf_counter()
                 result = evaluate_variant_fold(v, k, ctx, args)
-                print(f"{v} fold {k}: ok " + " ".join(f"{m}={result['metrics'][m]:.3f}" for m in ("map50_95", "f1_micro")))
+                print(f"{v} fold {k}: ok ({fmt_duration(time.perf_counter() - t0)}) " + " ".join(f"{m}={result['metrics'][m]:.3f}" for m in ("map50_95", "f1_micro")))
             except Exception as e:  # noqa: BLE001 - varian gagal ditandai, varian lain tetap jalan
                 result = {"status": "GAGAL", "fold": k, "reason": f"{type(e).__name__}: {e}"}
                 print(f"{v} fold {k}: GAGAL ({result['reason']})")

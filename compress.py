@@ -2,10 +2,11 @@
 import argparse
 import json
 import shutil
+import time
 import traceback
 from pathlib import Path
 
-from train import done_matches, drop_checkpoints, resolve_out, write_done
+from train import done_matches, drop_checkpoints, fmt_duration, resolve_out, write_done
 
 try:
     from onnxruntime.quantization import CalibrationDataReader as _ReaderBase
@@ -220,11 +221,12 @@ def main(argv=None) -> None:
             (dest / "DONE").unlink(missing_ok=True)
             dest.mkdir(parents=True, exist_ok=True)
             (dest / "FAILED.txt").unlink(missing_ok=True)
+            t0 = time.perf_counter()
             try:
                 info = BUILDERS[v](fold, dest, a)
                 (dest / "info.json").write_text(json.dumps(info), encoding="utf-8")
                 write_done(dest / "DONE", settings)
-                print(f"fold {k} {v}: selesai {info}")
+                print(f"fold {k} {v}: selesai ({fmt_duration(time.perf_counter() - t0)}) {info}")
             except Exception as e:  # noqa: BLE001 - varian gagal ditandai, varian lain tetap jalan
                 (dest / "FAILED.txt").write_text(f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}", encoding="utf-8")
                 print(f"fold {k} {v}: GAGAL ({type(e).__name__}: {e})")

@@ -4,12 +4,33 @@ import json
 import os
 import random
 import shutil
+import time
 from collections import defaultdict
 from pathlib import Path
 
 ANN_NAME = "_annotations.coco.json"
 K = 5  # jumlah fold; --folds hanya membatasi berapa fold yang dijalankan
 ENV_VARS = ("ROBOFLOW_API_KEY", "ROBOFLOW_WORKSPACE", "ROBOFLOW_PROJECT", "ROBOFLOW_VERSION")
+
+
+def fmt_duration(seconds: float) -> str:
+    """Durasi ringkas dalam bahasa Indonesia: '45 detik', '40 menit', '1 jam 12 menit'."""
+    if seconds < 60:
+        return f"{round(seconds)} detik"
+    h, m = divmod(round(seconds / 60), 60)
+    if h == 0:
+        return f"{m} menit"
+    return f"{h} jam {m} menit" if m else f"{h} jam"
+
+
+def eta_line(durations: list, remaining: int) -> str:
+    """'selesai dalam X; perkiraan sisa Y' dari durasi unit yang sudah selesai (sisa = rata-rata x unit tersisa)."""
+    if not durations:
+        return ""
+    text = f"selesai dalam {fmt_duration(durations[-1])}"
+    if remaining > 0:
+        text += f"; perkiraan sisa {fmt_duration(sum(durations) / len(durations) * remaining)}"
+    return text
 
 
 def drop_checkpoints(run_dir: Path) -> None:
@@ -198,14 +219,18 @@ def main(argv=None) -> None:
 
     from rfdetr import RFDETRSegSmall
 
+    settings = {"epochs": a.epochs, "seed": a.seed, "k": K, "version": env["version"]}
+    pending = sum(1 for k in range(min(a.folds, K)) if not done_matches(a.out / f"fold{k}" / "DONE", settings))
+    durations = []
     for k in range(min(a.folds, K)):
         fold = a.out / f"fold{k}"
-        settings = {"epochs": a.epochs, "seed": a.seed, "k": K, "version": env["version"]}
         if done_matches(fold / "DONE", settings):
             print(f"fold {k}: sudah selesai, dilewati")
             continue
         if (fold / "DONE").exists():  # jangan menimpa/memakai ulang hasil yang dibuat dengan pengaturan lain
             raise SystemExit(f"{fold} dibuat dengan pengaturan lain ({(fold / 'DONE').read_text(encoding='utf-8')[:120]}), sekarang {settings}. Hapus folder itu atau pakai --out lain.")
+        t0 = time.perf_counter()
+        print(f"fold {k}: mulai ({len(durations) + 1} dari {pending} yang dijalankan)")
         ds_dir = write_fold_dir(merged, folds, k, a.out / "merged" / "images", fold / "dataset")
         train_coco = json.loads((ds_dir / "train" / ANN_NAME).read_text(encoding="utf-8"))
         (fold / "classes.json").write_text(json.dumps(fold_classes(train_coco)), encoding="utf-8")
@@ -214,7 +239,8 @@ def main(argv=None) -> None:
         shutil.copy2(fold / "run" / "last_ema.pth", fold / "weights.pth")
         drop_checkpoints(fold / "run")
         write_done(fold / "DONE", settings)
-        print(f"fold {k}: selesai")
+        durations.append(time.perf_counter() - t0)
+        print(f"fold {k}: {eta_line(durations, pending - len(durations))}")
 
 
 if __name__ == "__main__":

@@ -45,7 +45,7 @@ python -c "from dotenv import load_dotenv; load_dotenv(); from train import load
 # 4) pipeline di nohup; hasil dibungkus bila semua langkah berhasil
 mkdir -p "$OUT"
 nohup bash -c "python train.py $SMOKE && python compress.py $SMOKE && python evaluate.py $SMOKE \
-  && tar czf $OUT/results.tar.gz -C $OUT results && echo PIPELINE SELESAI || echo PIPELINE GAGAL" \
+  && tar czf $OUT/results.tar.gz -C $OUT results && echo \"PIPELINE SELESAI (total \$((SECONDS / 60)) menit)\" || echo \"PIPELINE GAGAL (setelah \$((SECONDS / 60)) menit)\"" \
   > "$OUT/run.log" 2>&1 &
 echo "Pipeline berjalan di latar belakang (PID $!). Pantau: tail -f $OUT/run.log"
 echo "Setelah 'PIPELINE SELESAI': periksa baris PERINGATAN dan summary.csv, scp $OUT/results.tar.gz ke komputer Anda, lalu destroy instance."
