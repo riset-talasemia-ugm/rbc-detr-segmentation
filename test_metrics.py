@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from evaluate import Instances, confusion_matrix, match_instances, summarize
 from train import load_or_create_folds, make_folds, merge_coco, write_fold_dir
 
 
@@ -106,6 +107,62 @@ def test_write_fold_dir_splits_by_fold():
         assert sorted(im["id"] for im in valid["images"]) == sorted(folds[2])
         assert len(train["images"]) == 10 - len(folds[2])
         assert len(list((out / "valid").glob("*.jpg"))) == len(folds[2])
+
+
+def rect_masks(*boxes, size=10):
+    """boxes = (r0, r1, c0, c1) -> mask bool (N, size, size)."""
+    m = np.zeros((len(boxes), size, size), bool)
+    for i, (r0, r1, c0, c1) in enumerate(boxes):
+        m[i, r0:r1, c0:c1] = True
+    return m
+
+
+def inst(boxes, classes, scores=None, size=10):
+    masks = rect_masks(*boxes, size=size) if boxes else np.zeros((0, size, size), bool)
+    sc = np.ones(len(classes)) if scores is None else np.array(scores, float)
+    return Instances(masks, np.array(classes, int), sc)
+
+
+A, B, C_, D = (0, 2, 0, 2), (3, 5, 3, 5), (6, 8, 6, 8), (8, 10, 0, 2)
+
+
+def test_confusion_and_metrics_by_hand():
+    gt = inst([A, B, C_], [0, 1, 0])
+    pred = inst([A, B, D], [0, 0, 1])  # A benar, B salah kelas, D tanpa GT, C tanpa prediksi
+    cm = confusion_matrix(match_instances(gt, pred), gt, pred, num_classes=2)
+    assert cm.tolist() == [[1, 0, 1], [1, 0, 0], [0, 1, 0]], cm
+    s = summarize(cm)
+    for k in ("precision_micro", "recall_micro", "f1_micro"):
+        assert abs(s[k] - 1 / 3) < 1e-9, (k, s[k])
+    assert abs(s["accuracy_detection"] - 0.2) < 1e-9
+    assert abs(s["accuracy_classification"] - 0.5) < 1e-9
+
+
+def test_empty_gt_and_empty_pred():
+    gt0, pred0 = inst([], []), inst([], [])
+    assert confusion_matrix(match_instances(gt0, pred0), gt0, pred0, 2).sum() == 0
+    pred2 = inst([A, B], [0, 1])
+    cm = confusion_matrix(match_instances(gt0, pred2), gt0, pred2, 2)
+    assert cm.tolist() == [[0, 0, 0], [0, 0, 0], [1, 1, 0]], cm  # semua FP
+    gt2 = inst([A, B], [0, 1])
+    cm = confusion_matrix(match_instances(gt2, pred0), gt2, pred0, 2)
+    assert cm.tolist() == [[0, 0, 1], [0, 0, 1], [0, 0, 0]], cm  # semua FN
+    summarize(np.zeros((3, 3), int))  # tidak boleh exception
+
+
+def test_class_without_instances_is_nan():
+    gt = inst([A, B], [0, 1])
+    pred = inst([A, B], [0, 1])
+    s = summarize(confusion_matrix(match_instances(gt, pred), gt, pred, num_classes=3))
+    assert np.isnan(s["per_class"][2]["precision"]) and np.isnan(s["per_class"][2]["recall"])
+    assert s["precision_macro"] == 1.0 and s["recall_macro"] == 1.0
+
+
+def test_score_threshold_drops_low_scores():
+    gt = inst([A], [0])
+    pred = inst([A], [0], scores=[0.4])
+    cm = confusion_matrix(match_instances(gt, pred, score_thr=0.5), gt, pred, 1)
+    assert cm.tolist() == [[0, 1], [0, 0]], cm  # GT jadi FN, tidak ada FP
 
 
 if __name__ == "__main__":
