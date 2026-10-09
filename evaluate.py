@@ -155,21 +155,42 @@ def decode_masks(mask_logits: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     return torch.cat(out).squeeze(1).numpy()
 
 
+def _ort_providers(ort) -> list[str]:
+    """CUDA EP bila tersedia (bukan TensorRT EP, yang membangun engine saat pertama jalan), lalu CPU."""
+    if hasattr(ort, "preload_dlls"):  # ORT >= 1.21: muat pustaka CUDA/cuDNN dari paket pip torch/nvidia
+        try:
+            ort.preload_dlls()
+        except Exception:  # noqa: BLE001 - tanpa GPU/pustaka: biarkan CPU EP
+            pass
+    return [p for p in ("CUDAExecutionProvider",) if p in ort.get_available_providers()] + ["CPUExecutionProvider"]
+
+
+def ort_model_latency(onnx_path: Path, warmup: int = 10, n: int = 50) -> float:
+    """Latency rerata (ms) satu session.run pada model ONNX saja (input acak, tanpa pre/pascaproses), provider sama dengan OrtPredictor.
+    Untuk membandingkan ONNX fp32 vs int8 di runtime yang sama (kolom predict() ujung-ke-ujung tidak sebanding)."""
+    import onnxruntime as ort
+
+    sess = ort.InferenceSession(str(onnx_path), providers=_ort_providers(ort))
+    inp = sess.get_inputs()[0]
+    x = np.random.default_rng(0).standard_normal([d if isinstance(d, int) else 1 for d in inp.shape]).astype(np.float32)
+    for _ in range(warmup):
+        sess.run(None, {inp.name: x})
+    times = []
+    for _ in range(n):
+        t0 = time.perf_counter()
+        sess.run(None, {inp.name: x})
+        times.append((time.perf_counter() - t0) * 1000)
+    return float(np.mean(times))
+
+
 class OrtPredictor:
     """Prediktor ONNX Runtime (varian int8): preprocess dan decode mengikuti referensi rfdetr; mask lewat decode_masks."""
 
     def __init__(self, name: str, onnx_path: Path):
         import onnxruntime as ort
 
-        if hasattr(ort, "preload_dlls"):  # ORT >= 1.21: muat pustaka CUDA/cuDNN dari paket pip torch/nvidia
-            try:
-                ort.preload_dlls()
-            except Exception:  # noqa: BLE001 - tanpa GPU/pustaka: biarkan CPU EP
-                pass
-        want = [p for p in ("TensorrtExecutionProvider", "CUDAExecutionProvider") if p in ort.get_available_providers()]
-        want = [p for p in want if p != "TensorrtExecutionProvider"]  # TensorRT EP membangun engine saat pertama jalan; pakai CUDA EP
         self.name = name
-        self.session = ort.InferenceSession(str(onnx_path), providers=want + ["CPUExecutionProvider"])
+        self.session = ort.InferenceSession(str(onnx_path), providers=_ort_providers(ort))
         self.providers = self.session.get_providers()  # dicatat ke summary: bila hanya CPU, latency tidak sebanding dengan GPU
         inp = self.session.get_inputs()[0]
         self.input_name, (_, _, self.h, self.w) = inp.name, inp.shape
@@ -504,6 +525,10 @@ def variant_cost(variant: str, pred, fold_dir: Path, image_paths: list, n: int, 
         cost["torch_peak_alloc_mb"] = None  # tidak memakai alokator torch
         cost["provider"] = ",".join(pred.providers)
         cost["gflops"], cost["gflops_note"] = None, "sama dengan fp32 (jumlah operasi tidak berubah)"
+        # perbandingan sebanding di runtime yang sama: model ONNX fp32 vs int8, tanpa pre/pascaproses
+        cost["onnx_int8_model_ms"] = ort_model_latency(wp)
+        fp32_onnx = sorted((fold_dir / "variants" / "int8" / "onnx_fp32").glob("*.onnx"))
+        cost["onnx_fp32_model_ms"] = ort_model_latency(fp32_onnx[0]) if fp32_onnx else None
     elif variant == "fp16":  # inference(inplace=True) mengosongkan modul PyTorch: params/file_mb/gflops diisi dari fp32 di write_summary
         cost["params"] = cost["nonzero_params"] = cost["file_mb"] = None
         cost["provider"] = "cuda" if torch.cuda.is_available() else "cpu"

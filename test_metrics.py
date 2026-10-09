@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image
 
 from check_gpu import arch_supported
-from evaluate import _warm_cuda, measure_cost
+from evaluate import _warm_cuda, measure_cost, ort_model_latency
 from evaluate import Instances, aggregate, panel_state, result_is_current, write_summary, coco_map, count_gflops, gt_instances, plot_confusion, remap_instances, save_panel, confusion_matrix, match_instances, load_predictor, summarize, to_instances
 from train import done_matches, drop_checkpoints, load_env, resolve_out, write_done, load_or_create_folds, make_folds, merge_coco, write_fold_dir
 
@@ -568,6 +568,25 @@ def test_drop_checkpoints_keeps_logs_only():
 
 def test_warm_cuda_is_safe_without_gpu():
     assert _warm_cuda() is None
+
+
+def test_ort_model_latency_on_tiny_onnx():
+    import onnx
+    from onnx import TensorProto, helper
+
+    node = helper.make_node("Relu", ["input"], ["output"])
+    graph = helper.make_graph(
+        [node], "tiny",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 8, 8])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 3, 8, 8])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    with tempfile.TemporaryDirectory() as t:
+        p = Path(t) / "tiny.onnx"
+        onnx.save(model, str(p))
+        ms = ort_model_latency(p, warmup=1, n=3)
+    assert 0 < ms < 5000  # milidetik per session.run; hanya model, tanpa pre/pascaproses
 
 
 if __name__ == "__main__":
