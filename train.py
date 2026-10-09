@@ -1,11 +1,28 @@
 """Unduh dataset Roboflow, gabungkan semua split, bagi 5 fold terstratifikasi, latih satu model per fold."""
+import argparse
 import json
+import os
 import random
 import shutil
 from collections import defaultdict
 from pathlib import Path
 
 ANN_NAME = "_annotations.coco.json"
+K = 5  # jumlah fold; --folds hanya membatasi berapa fold yang dijalankan
+ENV_VARS = ("ROBOFLOW_API_KEY", "ROBOFLOW_WORKSPACE", "ROBOFLOW_PROJECT", "ROBOFLOW_VERSION")
+
+
+def load_env(environ=None) -> dict:
+    """Baca kredensial Roboflow dari environment; berhenti dengan pesan jelas bila ada yang kosong."""
+    environ = os.environ if environ is None else environ
+    missing = [v for v in ENV_VARS if not (environ.get(v) or "").strip()]
+    if missing:
+        raise SystemExit(f"Variabel .env kosong: {', '.join(missing)}. Salin .env.example ke .env dan isi.")
+    try:
+        version = int(environ["ROBOFLOW_VERSION"])
+    except ValueError:
+        raise SystemExit("ROBOFLOW_VERSION harus berupa angka (nomor versi dataset).") from None
+    return {"api_key": environ["ROBOFLOW_API_KEY"], "workspace": environ["ROBOFLOW_WORKSPACE"], "project": environ["ROBOFLOW_PROJECT"], "version": version}
 
 
 def merge_coco(src_dirs: list[Path], out_dir: Path) -> dict:
@@ -101,3 +118,72 @@ def load_or_create_folds(coco: dict, k: int, seed: int, path: Path) -> list[list
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"k": k, "seed": seed, "n_images": n, "folds": folds}), encoding="utf-8")
     return folds
+
+
+def download_dataset(env: dict, dest: Path) -> list[Path]:
+    """Unduh versi dataset (coco-segmentation, fallback coco); kembalikan folder split yang punya anotasi."""
+    from roboflow import Roboflow
+
+    version = Roboflow(api_key=env["api_key"]).workspace(env["workspace"]).project(env["project"]).version(env["version"])
+    try:
+        ds = version.download("coco-segmentation", location=str(dest))
+    except Exception as e:  # noqa: BLE001 - nama format bisa berbeda antar versi roboflow
+        print(f"coco-segmentation gagal ({e}); mencoba 'coco'")
+        ds = version.download("coco", location=str(dest))
+    return [d for d in (Path(ds.location) / s for s in ("train", "valid", "test")) if (d / ANN_NAME).exists()]
+
+
+def fold_classes(train_coco: dict) -> list[int]:
+    """category_id dalam urutan label rfdetr (kategori beranotasi, tanpa kategori induk) untuk split train ini."""
+    from rfdetr.datasets.coco import annotated_category_ids, filter_parent_categories
+
+    kept = filter_parent_categories(train_coco["categories"], annotated_category_ids(train_coco))
+    return [int(c["id"]) for c in kept]
+
+
+def main(argv=None) -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--epochs", type=int, default=50)
+    ap.add_argument("--folds", type=int, default=K, help="jalankan hanya N fold pertama (dari K=5)")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--smoke", action="store_true", help="1 fold, 1 epoch")
+    ap.add_argument("--out", type=Path, default=Path("outputs"))
+    ap.add_argument("--data", type=Path, default=Path("data"))
+    a = ap.parse_args(argv)
+    if a.smoke:
+        a.folds, a.epochs = 1, 1
+
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    env = load_env()  # gagal di sini, sebelum memakai waktu GPU
+    import torch
+
+    if not torch.cuda.is_available():
+        print("PERINGATAN: GPU tidak terdeteksi; training akan sangat lambat.")
+
+    splits = download_dataset(env, a.data)
+    merged = merge_coco(splits, a.out / "merged")
+    annotated = {x["category_id"] for x in merged["annotations"]}
+    print(f"{len(merged['images'])} gambar asli, {len(annotated)} kelas beranotasi (perkiraan: ~170 gambar, 13 kelas)")
+    folds = load_or_create_folds(merged, K, a.seed, a.out / "folds.json")
+
+    from rfdetr import RFDETRSegSmall
+
+    for k in range(min(a.folds, K)):
+        fold = a.out / f"fold{k}"
+        if (fold / "DONE").exists():
+            print(f"fold {k}: sudah selesai, dilewati")
+            continue
+        ds_dir = write_fold_dir(merged, folds, k, a.out / "merged" / "images", fold / "dataset")
+        train_coco = json.loads((ds_dir / "train" / ANN_NAME).read_text(encoding="utf-8"))
+        (fold / "classes.json").write_text(json.dumps(fold_classes(train_coco)), encoding="utf-8")
+        # Bobot terakhir (EMA akhir), bukan checkpoint_best_*: yang terbaik dipilih di fold valid sehingga skornya optimistis.
+        RFDETRSegSmall().train(dataset_dir=str(ds_dir), epochs=a.epochs, batch_size="auto", lr=1e-4, output_dir=str(fold / "run"))
+        shutil.copy2(fold / "run" / "last_ema.pth", fold / "weights.pth")
+        (fold / "DONE").write_text("ok")
+        print(f"fold {k}: selesai")
+
+
+if __name__ == "__main__":
+    main()

@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image
 
 from evaluate import Instances, coco_map, confusion_matrix, match_instances, resolve_mapping, summarize
-from train import load_or_create_folds, make_folds, merge_coco, write_fold_dir
+from train import load_env, load_or_create_folds, make_folds, merge_coco, write_fold_dir
 
 
 def synthetic_coco(n_images=10, class1_images=(0, 2, 4, 6, 8), with_empty=()):
@@ -196,6 +196,25 @@ def test_mapping_skips_unannotated_supercategory():
     assert resolve_mapping([0, 1, 2], [1, 2], {0, 1}, scores={"direct": 0.5, "index_all": 0.1, "index_real": 0.2}) == "direct"
     # kelas model di luar jangkauan suatu mapping -> mapping itu tidak valid
     assert resolve_mapping([1, 2, 3], [1, 2, 3], {0, 1, 2}) == "index_real"
+
+
+def test_load_env_requires_all_variables():
+    full = {"ROBOFLOW_API_KEY": "k", "ROBOFLOW_WORKSPACE": "w", "ROBOFLOW_PROJECT": "p", "ROBOFLOW_VERSION": "8"}
+    assert load_env(full) == {"api_key": "k", "workspace": "w", "project": "p", "version": 8}
+    for missing in full:
+        env = {**full, missing: ""}
+        try:
+            load_env(env)
+        except SystemExit as e:
+            assert missing in str(e)
+            continue
+        raise AssertionError(f"SystemExit tidak muncul saat {missing} kosong")
+    try:
+        load_env({**full, "ROBOFLOW_VERSION": "delapan"})
+    except SystemExit as e:
+        assert "ROBOFLOW_VERSION" in str(e)
+    else:
+        raise AssertionError("versi non-angka harus ditolak")
 
 
 if __name__ == "__main__":
