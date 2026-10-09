@@ -6,6 +6,7 @@ import contextlib
 import io
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import numpy as np
 
@@ -135,3 +136,37 @@ def resolve_mapping(cat_ids: list[int], real_ids: list[int], raw_class_ids: set[
     if scores:
         return max(valid, key=lambda n: scores.get(n, float("-inf")))
     return "index_real" if "index_real" in valid else valid[0]
+
+
+class Predictor(Protocol):
+    name: str
+
+    def predict(self, image, threshold: float):  # PIL.Image -> supervision.Detections (mask berukuran gambar asli)
+        ...
+
+
+class TorchPredictor:
+    def __init__(self, name: str, model):
+        self.name, self.model = name, model
+
+    def predict(self, image, threshold: float):
+        return self.model.predict(image, threshold=threshold)
+
+
+def to_instances(det, size: tuple[int, int]) -> Instances:
+    """sv.Detections -> Instances. size = (tinggi, lebar) gambar asli. Tanpa mask -> tidak ada instance."""
+    if det.mask is None or len(det) == 0:
+        return Instances(np.zeros((0, *size), bool), np.zeros(0, int), np.zeros(0, float))
+    return Instances(det.mask.astype(bool), det.class_id.astype(int), det.confidence.astype(float))
+
+
+def load_predictor(variant: str, fold_dir: Path, num_classes: int) -> Predictor:
+    """Muat prediktor satu varian dari artefak fold. Varian lain ditambahkan di task berikutnya."""
+    if variant in ("fp32", "fp16"):
+        from rfdetr import RFDETRSegSmall
+
+        model = RFDETRSegSmall(pretrain_weights=str(Path(fold_dir) / "weights.pth"), num_classes=num_classes)
+        if variant == "fp16":
+            model.inference(compile=False, inplace=True, dtype="float16")  # tidak dapat dibalik; hanya untuk inference
+        return TorchPredictor(variant, model)
+    raise NotImplementedError(variant)

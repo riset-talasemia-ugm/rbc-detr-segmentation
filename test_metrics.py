@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from evaluate import Instances, coco_map, confusion_matrix, match_instances, resolve_mapping, summarize
+from evaluate import Instances, coco_map, confusion_matrix, match_instances, resolve_mapping, summarize, to_instances
 from train import load_env, load_or_create_folds, make_folds, merge_coco, write_fold_dir
 
 
@@ -215,6 +215,20 @@ def test_load_env_requires_all_variables():
         assert "ROBOFLOW_VERSION" in str(e)
     else:
         raise AssertionError("versi non-angka harus ditolak")
+
+
+def test_to_instances_without_and_with_mask():
+    import supervision as sv
+
+    empty = to_instances(sv.Detections.empty(), (10, 12))
+    assert empty.masks.shape == (0, 10, 12) and empty.masks.dtype == bool
+    assert len(empty.class_id) == 0 and len(empty.score) == 0
+    m = rect_masks(A, B, size=10)
+    det = sv.Detections(xyxy=np.array([[0, 0, 2, 2], [3, 3, 5, 5]], float), mask=m, class_id=np.array([1, 0]), confidence=np.array([0.9, 0.6]))
+    got = to_instances(det, (10, 10))
+    assert np.array_equal(got.masks, m) and got.class_id.tolist() == [1, 0] and got.score.tolist() == [0.9, 0.6]
+    no_mask = sv.Detections(xyxy=np.array([[0, 0, 2, 2]], float), class_id=np.array([1]), confidence=np.array([0.9]))
+    assert to_instances(no_mask, (10, 10)).masks.shape == (0, 10, 10)  # tanpa mask = tidak ada instance bermask
 
 
 if __name__ == "__main__":
