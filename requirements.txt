@@ -1,6 +1,7 @@
 torch
 roboflow
-rfdetr
+rfdetr[train]
 supervision
 pillow
 python-dotenv
+pycocotools

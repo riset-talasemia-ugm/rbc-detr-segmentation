@@ -38,7 +38,7 @@ Annotations are expected in COCO instance format (polygon or RLE masks). Dataset
    cp .env.example .env           # Windows: copy .env.example .env
    ```
 
-5. Check that the setup works by downloading the dataset in COCO format:
+5. Check that the setup works by downloading the dataset in COCO segmentation format:
 
    ```python
    import os
@@ -48,7 +48,7 @@ Annotations are expected in COCO instance format (polygon or RLE masks). Dataset
    load_dotenv()
    rf = Roboflow(api_key=os.environ["ROBOFLOW_API_KEY"])
    project = rf.workspace(os.environ["ROBOFLOW_WORKSPACE"]).project(os.environ["ROBOFLOW_PROJECT"])
-   dataset = project.version(int(os.environ["ROBOFLOW_VERSION"])).download("coco", location="data")
+   dataset = project.version(int(os.environ["ROBOFLOW_VERSION"])).download("coco-segmentation", location="data")
    print(dataset.location)
    ```
 
