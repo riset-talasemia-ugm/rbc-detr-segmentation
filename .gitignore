@@ -21,3 +21,6 @@ notebooks/
 
 # SDD workspace
 .superpowers/
+
+# Spec dan plan hanya lokal (tidak dipublikasikan)
+docs/superpowers/
