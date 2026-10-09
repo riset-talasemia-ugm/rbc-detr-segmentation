@@ -15,12 +15,12 @@ Annotations are expected in COCO instance format (polygon or RLE masks). Dataset
    cd rbc-detr-segmentation
    ```
 
-2. Create a virtual environment and install the dependencies:
+2. Create a virtual environment and install the dependencies with [uv](https://docs.astral.sh/uv/):
 
    ```
-   python -m venv .venv
+   uv venv
    source .venv/bin/activate      # Windows: .venv\Scripts\activate
-   pip install -r requirements.txt
+   uv pip install -r requirements.txt
    ```
 
 3. Copy `.env.example` to `.env` and fill in your Roboflow credentials (`.env` is git-ignored, never commit it):
