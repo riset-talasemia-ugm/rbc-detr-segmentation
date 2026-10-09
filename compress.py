@@ -5,7 +5,7 @@ import shutil
 import traceback
 from pathlib import Path
 
-from train import done_matches, resolve_out, write_done
+from train import done_matches, drop_checkpoints, resolve_out, write_done
 
 try:
     from onnxruntime.quantization import CalibrationDataReader as _ReaderBase
@@ -37,6 +37,8 @@ def prune_unstructured(weights_in: Path, weights_out: Path, amount: float = 0.5)
     import torch
 
     ckpt = torch.load(weights_in, map_location="cpu", weights_only=False)  # berkas buatan kita sendiri
+    # hanya kunci yang dibutuhkan pemuat: salinan tensor lama (state_dict/callbacks) menggandakan ukuran file
+    ckpt = {k: ckpt[k] for k in ("model", "args", "model_config") if k in ckpt}
     ckpt["model"], sparsity = prune_state_dict(ckpt["model"], amount)
     weights_out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(ckpt, weights_out)
@@ -120,6 +122,7 @@ def prune_structured(fold: Path, weights_out: Path, ratio: float = 0.3, finetune
     finally:
         T.RFDETRModelModule = orig
     shutil.copy2(run_dir / "last_ema.pth", weights_out)
+    drop_checkpoints(run_dir)
     return {"kept_ffn_fraction": kept["fraction"]}
 
 

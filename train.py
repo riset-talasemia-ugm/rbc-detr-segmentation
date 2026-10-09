@@ -12,6 +12,15 @@ K = 5  # jumlah fold; --folds hanya membatasi berapa fold yang dijalankan
 ENV_VARS = ("ROBOFLOW_API_KEY", "ROBOFLOW_WORKSPACE", "ROBOFLOW_PROJECT", "ROBOFLOW_VERSION")
 
 
+def drop_checkpoints(run_dir: Path) -> None:
+    """Hapus checkpoint besar (*.ckpt dan *.pth) dari folder run setelah bobot yang dipakai disalin; log tetap.
+    Mencegah disk penuh: tiap fold 50 epoch menyimpan beberapa checkpoint penuh (optimizer ikut) ratusan MB."""
+    run_dir = Path(run_dir)
+    if run_dir.is_dir():
+        for f in [*run_dir.glob("*.ckpt"), *run_dir.glob("*.pth")]:
+            f.unlink()
+
+
 def resolve_out(out, smoke: bool) -> Path:
     """Folder keluaran: --out eksplisit; bila tidak, smoke memakai outputs_smoke agar tidak bercampur dengan run penuh."""
     return Path(out) if out else Path("outputs_smoke" if smoke else "outputs")
@@ -203,6 +212,7 @@ def main(argv=None) -> None:
         # Bobot terakhir (EMA akhir), bukan checkpoint_best_*: yang terbaik dipilih di fold valid sehingga skornya optimistis.
         RFDETRSegSmall().train(dataset_dir=str(ds_dir), epochs=a.epochs, batch_size="auto", lr=1e-4, output_dir=str(fold / "run"))
         shutil.copy2(fold / "run" / "last_ema.pth", fold / "weights.pth")
+        drop_checkpoints(fold / "run")
         write_done(fold / "DONE", settings)
         print(f"fold {k}: selesai")
 

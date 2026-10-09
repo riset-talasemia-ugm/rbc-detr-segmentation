@@ -8,8 +8,9 @@ import numpy as np
 from PIL import Image
 
 from check_gpu import arch_supported
+from evaluate import _warm_cuda, measure_cost
 from evaluate import Instances, aggregate, panel_state, result_is_current, write_summary, coco_map, count_gflops, gt_instances, plot_confusion, remap_instances, save_panel, confusion_matrix, match_instances, load_predictor, summarize, to_instances
-from train import done_matches, load_env, resolve_out, write_done, load_or_create_folds, make_folds, merge_coco, write_fold_dir
+from train import done_matches, drop_checkpoints, load_env, resolve_out, write_done, load_or_create_folds, make_folds, merge_coco, write_fold_dir
 
 
 def synthetic_coco(n_images=10, class1_images=(0, 2, 4, 6, 8), with_empty=()):
@@ -252,10 +253,11 @@ def test_prune_unstructured_keeps_checkpoint_format():
         t = Path(t)
         torch.manual_seed(0)
         sd = nn.Linear(16, 16).state_dict()
-        torch.save({"model": sd, "args": {"epochs": 1}, "model_config": {"x": 1}}, t / "in.pth")
+        torch.save({"model": sd, "args": {"epochs": 1}, "model_config": {"x": 1}, "state_dict": {"model.weight": sd["weight"].clone()}, "callbacks": {"ema": {"w": sd["weight"].clone()}}}, t / "in.pth")
         sparsity = prune_unstructured(t / "in.pth", t / "sub" / "out.pth", amount=0.5)
         out = torch.load(t / "sub" / "out.pth", weights_only=False)
         assert out["args"] == {"epochs": 1} and out["model_config"] == {"x": 1}
+        assert set(out) == {"model", "args", "model_config"}  # salinan tensor lama (state_dict/callbacks) tidak ikut: ukuran file jujur
         assert abs((out["model"]["weight"] == 0).float().mean().item() - sparsity) < 1e-9 and sparsity > 0.4
 
 
@@ -531,6 +533,41 @@ def test_arch_supported_requires_exact_gpu_architecture():
     assert arch_supported((12, 0), new_torch)
     assert not arch_supported((8, 9), ["sm_80", "sm_86"])  # RTX 4090 butuh sm_89
     assert not arch_supported((12, 0), [])
+
+
+def test_measure_cost_uses_fixed_workload_threshold():
+    seen = []
+
+    class Fake:
+        name = "fake"
+
+        def predict(self, image, threshold):
+            seen.append(threshold)
+
+    with tempfile.TemporaryDirectory() as t:
+        paths = []
+        for i in range(2):
+            p = Path(t) / f"m{i}.jpg"
+            Image.new("RGB", (16, 16)).save(p)
+            paths.append(p)
+        out = measure_cost(Fake(), paths, warmup=1, n=2)
+    assert seen and set(seen) == {0.0}  # beban pascaproses konstan (100 deteksi) di semua varian
+    assert out["latency_ms_mean"] >= 0 and out["fps"] > 0
+
+
+def test_drop_checkpoints_keeps_logs_only():
+    with tempfile.TemporaryDirectory() as t:
+        run = Path(t) / "run"
+        run.mkdir()
+        for name in ("last.ckpt", "checkpoint_10.ckpt", "last_ema.pth", "checkpoint_best_total.pth", "metrics.csv"):
+            (run / name).write_text("x")
+        drop_checkpoints(run)
+        assert sorted(p.name for p in run.iterdir()) == ["metrics.csv"]
+        drop_checkpoints(Path(t) / "tidak_ada")  # folder tidak ada: tidak error
+
+
+def test_warm_cuda_is_safe_without_gpu():
+    assert _warm_cuda() is None
 
 
 if __name__ == "__main__":

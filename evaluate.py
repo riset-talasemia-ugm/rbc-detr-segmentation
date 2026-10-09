@@ -349,8 +349,10 @@ class _GpuSampler:
         return float(np.mean(self.util)) if self.util else None
 
 
-def measure_cost(predictor, images: list, warmup: int = 10, n: int = 100, threshold: float = 0.5) -> dict:
-    """Latency (rerata, p50, p95; ms), FPS, memori GPU puncak (MB), utilisasi rerata (%); batch 1, predict() ujung-ke-ujung."""
+def measure_cost(predictor, images: list, warmup: int = 10, n: int = 100, threshold: float = 0.0) -> dict:
+    """Latency (rerata, p50, p95; ms), FPS, memori GPU puncak (MB), utilisasi rerata (%); batch 1, predict() ujung-ke-ujung.
+    threshold=0.0 sengaja: semua varian mengolah 100 deteksi, jadi beban pascaproses sama (pada threshold 0.5 model yang
+    mendeteksi lebih sedikit tampak lebih cepat, mis. varian pruning yang runtuh)."""
     import torch
     from PIL import Image
 
@@ -410,6 +412,17 @@ def panel_state(status: str | None, has_npz: bool) -> str:
     if status == "ok":
         return "show" if has_npz else "skip"
     return "failed" if status == "GAGAL" else "skip"
+
+
+def _warm_cuda() -> None:
+    """Inisialisasi konteks CUDA/cuBLAS/cuDNN sekali di awal agar tidak terhitung pada varian pertama (baseline memori)."""
+    import torch
+
+    if torch.cuda.is_available():
+        x = torch.randn(64, 64, device="cuda")
+        (x @ x).sum().item()
+        torch.nn.functional.conv2d(torch.randn(1, 3, 32, 32, device="cuda"), torch.randn(4, 3, 3, 3, device="cuda")).sum().item()
+        torch.cuda.synchronize()
 
 
 def _gpu_used_mb():
@@ -661,6 +674,7 @@ def main(argv=None) -> None:
     if not torch.cuda.is_available():
         print("PERINGATAN: GPU tidak terdeteksi; latency/memori GPU tidak bermakna (kolom biaya diisi apa adanya dari CPU).")
     ctx = load_context(args.out)
+    _warm_cuda()
     for v in args.variants:
         for k in range(args.folds):
             rp = args.out / "results" / v / f"fold{k}.json"
