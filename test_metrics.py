@@ -231,6 +231,40 @@ def test_to_instances_without_and_with_mask():
     assert to_instances(no_mask, (10, 10)).masks.shape == (0, 10, 10)  # tanpa mask = tidak ada instance bermask
 
 
+def test_prune_state_dict_sparsity_and_exclusions():
+    import torch
+    import torch.nn as nn
+
+    from compress import prune_state_dict
+
+    torch.manual_seed(0)
+    m = nn.ModuleDict({"fc": nn.Linear(32, 64), "refpoint_embed": nn.Embedding(10, 8), "fc2": nn.Linear(64, 10)})
+    sd = {k: v.clone() for k, v in m.state_dict().items()}
+    pruned, sparsity = prune_state_dict(sd, 0.5)
+    w = torch.cat([pruned["fc.weight"].flatten(), pruned["fc2.weight"].flatten()])
+    assert abs(sparsity - 0.5) < 0.02 and abs((w == 0).float().mean().item() - sparsity) < 1e-9
+    assert torch.equal(pruned["refpoint_embed.weight"], sd["refpoint_embed.weight"])  # embedding tidak dipangkas
+    assert torch.equal(pruned["fc.bias"], sd["fc.bias"])  # bias tidak dipangkas
+    assert (sd["fc.weight"] == 0).sum() == 0  # input tidak dimutasi
+
+
+def test_prune_unstructured_keeps_checkpoint_format():
+    import torch
+    import torch.nn as nn
+
+    from compress import prune_unstructured
+
+    with tempfile.TemporaryDirectory() as t:
+        t = Path(t)
+        torch.manual_seed(0)
+        sd = nn.Linear(16, 16).state_dict()
+        torch.save({"model": sd, "args": {"epochs": 1}, "model_config": {"x": 1}}, t / "in.pth")
+        sparsity = prune_unstructured(t / "in.pth", t / "sub" / "out.pth", amount=0.5)
+        out = torch.load(t / "sub" / "out.pth", weights_only=False)
+        assert out["args"] == {"epochs": 1} and out["model_config"] == {"x": 1}
+        assert abs((out["model"]["weight"] == 0).float().mean().item() - sparsity) < 1e-9 and sparsity > 0.4
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0

@@ -162,10 +162,11 @@ def to_instances(det, size: tuple[int, int]) -> Instances:
 
 def load_predictor(variant: str, fold_dir: Path, num_classes: int) -> Predictor:
     """Muat prediktor satu varian dari artefak fold. Varian lain ditambahkan di task berikutnya."""
-    if variant in ("fp32", "fp16"):
+    if variant in ("fp32", "fp16", "prune_unstructured"):
         from rfdetr import RFDETRSegSmall
 
-        model = RFDETRSegSmall(pretrain_weights=str(Path(fold_dir) / "weights.pth"), num_classes=num_classes)
+        weights = Path(fold_dir) / ("variants/prune_unstructured/weights.pth" if variant == "prune_unstructured" else "weights.pth")
+        model = RFDETRSegSmall(pretrain_weights=str(weights), num_classes=num_classes)
         if variant == "fp16":
             model.inference(compile=False, inplace=True, dtype="float16")  # tidak dapat dibalik; hanya untuk inference
         return TorchPredictor(variant, model)
