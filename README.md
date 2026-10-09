@@ -15,7 +15,16 @@ Annotations are expected in COCO instance format (polygon or RLE masks). Dataset
    cd rbc-detr-segmentation
    ```
 
-2. Create a virtual environment and install the dependencies with [uv](https://docs.astral.sh/uv/):
+2. Install [uv](https://docs.astral.sh/uv/) once per machine, if you do not have it yet:
+
+   ```
+   # Windows
+   powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+   # Linux/macOS
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   ```
+
+3. Create a virtual environment and install the dependencies:
 
    ```
    uv venv
@@ -23,13 +32,13 @@ Annotations are expected in COCO instance format (polygon or RLE masks). Dataset
    uv pip install -r requirements.txt
    ```
 
-3. Copy `.env.example` to `.env` and fill in your Roboflow credentials (`.env` is git-ignored, never commit it):
+4. Copy `.env.example` to `.env` and fill in Roboflow credentials:
 
    ```
    cp .env.example .env           # Windows: copy .env.example .env
    ```
 
-4. Check that the setup works by downloading the dataset in COCO format:
+5. Check that the setup works by downloading the dataset in COCO format:
 
    ```python
    import os
