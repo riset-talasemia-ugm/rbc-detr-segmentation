@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from evaluate import Instances, coco_map, confusion_matrix, match_instances, load_predictor, resolve_mapping, summarize, to_instances
+from evaluate import Instances, aggregate, coco_map, count_gflops, gt_instances, plot_confusion, remap_instances, save_panel, confusion_matrix, match_instances, load_predictor, summarize, to_instances
 from train import load_env, load_or_create_folds, make_folds, merge_coco, write_fold_dir
 
 
@@ -189,13 +189,6 @@ def test_coco_map_perfect_and_empty():
         empty = coco_map(p, [], [1])
         assert empty["map50_95"] == 0.0 and empty["map50"] == 0.0
 
-
-def test_mapping_skips_unannotated_supercategory():
-    assert resolve_mapping([0, 1, 2], [1, 2], {0, 1}) == "index_real"
-    # skor mAP per kandidat menentukan bila diberikan
-    assert resolve_mapping([0, 1, 2], [1, 2], {0, 1}, scores={"direct": 0.5, "index_all": 0.1, "index_real": 0.2}) == "direct"
-    # kelas model di luar jangkauan suatu mapping -> mapping itu tidak valid
-    assert resolve_mapping([1, 2, 3], [1, 2, 3], {0, 1, 2}) == "index_real"
 
 
 def test_load_env_requires_all_variables():
@@ -393,6 +386,77 @@ def test_calibration_reader_yields_expected_shape():
         assert all(list(b) == ["input"] and b["input"].shape == (1, 3, 16, 16) and b["input"].dtype == np.float32 for b in got)
         reader.rewind()
         assert reader.get_next() is not None  # bisa diulang (kuantisasi membaca data lebih dari sekali)
+
+
+def test_remap_instances_drops_unknown_labels():
+    i = inst([A, B, C_], [0, 1, 2], scores=[0.9, 0.8, 0.7])
+    got = remap_instances(i, {0: 5, 2: 7})  # label 1 tidak dikenal -> dibuang
+    assert got.class_id.tolist() == [5, 7] and got.score.tolist() == [0.9, 0.7]
+    assert np.array_equal(got.masks, i.masks[[0, 2]])
+    assert remap_instances(inst([], []), {0: 1}).masks.shape == (0, 10, 10)
+
+
+def test_aggregate_mean_std_ignores_nan():
+    agg = aggregate([{"f1": 0.2, "p": float("nan")}, {"f1": 0.4, "p": float("nan")}, {"f1": 0.6, "p": 1.0}])
+    assert abs(agg["f1"][0] - 0.4) < 1e-9 and abs(agg["f1"][1] - 0.2) < 1e-9  # std sampel (ddof=1)
+    assert agg["p"] == (1.0, 0.0)  # satu nilai valid: std 0
+    assert np.isnan(aggregate([{"x": float("nan")}])["x"][0])
+
+
+def test_gt_instances_from_polygons_and_empty():
+    from pycocotools.coco import COCO
+
+    coco = {
+        "images": [{"id": 1, "file_name": "a.jpg", "width": 10, "height": 10}, {"id": 2, "file_name": "b.jpg", "width": 10, "height": 10}],
+        "annotations": [{"id": 1, "image_id": 1, "category_id": 7, "iscrowd": 0, "area": 4, "bbox": [0, 0, 2, 2], "segmentation": [[0, 0, 2, 0, 2, 2, 0, 2]]}],
+        "categories": [{"id": 7, "name": "x"}],
+    }
+    api = COCO()
+    api.dataset = coco
+    api.createIndex()
+    g = gt_instances(api, 1, {7: 3}, (10, 10))
+    assert g.class_id.tolist() == [3] and g.masks.shape == (1, 10, 10) and g.masks[0, :2, :2].all() and g.masks.sum() < 10
+    empty = gt_instances(api, 2, {7: 3}, (10, 10))
+    assert empty.masks.shape == (0, 10, 10) and len(empty.class_id) == 0
+
+
+def test_plot_confusion_writes_png_and_csv():
+    with tempfile.TemporaryDirectory() as t:
+        out = Path(t) / "cm.png"
+        plot_confusion(np.array([[3, 1, 0], [0, 2, 1], [1, 0, 0]]), ["a", "b"], out)
+        assert out.stat().st_size > 0 and (Path(t) / "cm_norm.png").stat().st_size > 0 and (Path(t) / "cm.csv").exists()
+        plot_confusion(np.zeros((3, 3), int), ["a", "b"], Path(t) / "z.png")  # matriks nol tidak boleh crash
+
+
+def test_save_panel_with_empty_and_failed_variants():
+    with tempfile.TemporaryDirectory() as t:
+        out = Path(t) / "panel.png"
+        img = Image.new("RGB", (10, 10), (120, 120, 120))
+        save_panel(img, inst([A], [0]), {"fp32": inst([A, B], [0, 1]), "int8": inst([], []), "prune_structured": None}, out)
+        assert out.stat().st_size > 0
+
+
+def test_count_gflops_matches_hand_computation():
+    import torch.nn as nn
+
+    conv = nn.Conv2d(3, 4, 3, bias=False)  # keluaran 4x6x6 = 144, tiap keluaran 27 MAC -> 3888 MAC = 7776 FLOP
+    assert abs(count_gflops(conv, 8) * 1e9 - 7776) < 1
+
+
+def test_count_gflops_on_real_model_and_pruning_reduces_it():
+    try:
+        from rfdetr import RFDETRSegSmall
+    except ImportError:
+        print("SKIP test_count_gflops_on_real_model_and_pruning_reduces_it (rfdetr tidak terpasang)")
+        return
+    from compress import prune_ffn
+
+    m = RFDETRSegSmall(pretrain_weights=None, device="cpu", num_classes=3)
+    res = m.model_config.resolution
+    full = count_gflops(m.model.model, res)
+    assert 10 < full < 500, full  # RFDETRSegSmall ~63 GFLOPs pada 384
+    prune_ffn(m.model.model, 0.3)
+    assert count_gflops(m.model.model, res) < full  # pruning terstruktur benar-benar menurunkan GFLOPs
 
 
 if __name__ == "__main__":
