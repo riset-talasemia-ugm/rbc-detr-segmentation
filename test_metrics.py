@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from evaluate import Instances, confusion_matrix, match_instances, summarize
+from evaluate import Instances, coco_map, confusion_matrix, match_instances, resolve_mapping, summarize
 from train import load_or_create_folds, make_folds, merge_coco, write_fold_dir
 
 
@@ -163,6 +163,39 @@ def test_score_threshold_drops_low_scores():
     pred = inst([A], [0], scores=[0.4])
     cm = confusion_matrix(match_instances(gt, pred, score_thr=0.5), gt, pred, 1)
     assert cm.tolist() == [[0, 1], [0, 0]], cm  # GT jadi FN, tidak ada FP
+
+
+def _rle(mask):
+    import pycocotools.mask as mu
+
+    r = mu.encode(np.asfortranarray(mask.astype(np.uint8)))
+    r["counts"] = r["counts"].decode()
+    return r
+
+
+def test_coco_map_perfect_and_empty():
+    mask = rect_masks(A)[0]
+    gt = {
+        "images": [{"id": 1, "file_name": "x.jpg", "width": 10, "height": 10}],
+        "annotations": [{"id": 1, "image_id": 1, "category_id": 1, "segmentation": _rle(mask), "area": int(mask.sum()), "bbox": [0, 0, 2, 2], "iscrowd": 0}],
+        "categories": [{"id": 0, "name": "super"}, {"id": 1, "name": "a"}],
+    }
+    with tempfile.TemporaryDirectory() as t:
+        p = Path(t) / "gt.json"
+        p.write_text(json.dumps(gt))
+        perfect = coco_map(p, [{"image_id": 1, "category_id": 1, "segmentation": _rle(mask), "score": 0.9}], [1])
+        assert abs(perfect["map50_95"] - 1.0) < 1e-6 and abs(perfect["map50"] - 1.0) < 1e-6
+        assert abs(perfect["ap_per_class"][1] - 1.0) < 1e-6
+        empty = coco_map(p, [], [1])
+        assert empty["map50_95"] == 0.0 and empty["map50"] == 0.0
+
+
+def test_mapping_skips_unannotated_supercategory():
+    assert resolve_mapping([0, 1, 2], [1, 2], {0, 1}) == "index_real"
+    # skor mAP per kandidat menentukan bila diberikan
+    assert resolve_mapping([0, 1, 2], [1, 2], {0, 1}, scores={"direct": 0.5, "index_all": 0.1, "index_real": 0.2}) == "direct"
+    # kelas model di luar jangkauan suatu mapping -> mapping itu tidak valid
+    assert resolve_mapping([1, 2, 3], [1, 2, 3], {0, 1, 2}) == "index_real"
 
 
 if __name__ == "__main__":

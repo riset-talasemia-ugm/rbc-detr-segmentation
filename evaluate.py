@@ -2,7 +2,10 @@
 
 Impor berat (torch, rfdetr, onnxruntime) dilakukan di dalam fungsi yang memakainya agar fungsi murni bisa diuji tanpa GPU.
 """
+import contextlib
+import io
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
@@ -88,3 +91,47 @@ def summarize(cm: np.ndarray) -> dict:
         "accuracy_classification": _ratio(TP, matched),
         "per_class": per_class,
     }
+
+
+def coco_map(gt_json: Path, preds: list[dict], img_ids: list[int]) -> dict:
+    """mAP50-95, mAP50, dan AP per kategori (COCOeval segm). preds berformat COCO (RLE). Kosong -> 0.0."""
+    from pycocotools.coco import COCO
+    from pycocotools.cocoeval import COCOeval
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        gt = COCO(str(gt_json))
+        annotated = sorted({a["category_id"] for a in gt.dataset["annotations"]})
+        if not preds:
+            return {"map50_95": 0.0, "map50": 0.0, "ap_per_class": {c: 0.0 for c in annotated}}
+        ev = COCOeval(gt, gt.loadRes(preds), "segm")
+        ev.params.imgIds = list(img_ids)
+        ev.evaluate()
+        ev.accumulate()
+        ev.summarize()
+    prec = ev.eval["precision"]  # (T, R, K, A, M); -1 = tanpa GT
+    ap = {}
+    for k, cat in enumerate(ev.params.catIds):
+        v = prec[:, :, k, 0, -1]
+        v = v[v > -1]
+        ap[cat] = float(v.mean()) if v.size else float("nan")
+    nan_if_neg = lambda x: float(x) if x >= 0 else float("nan")  # noqa: E731
+    return {"map50_95": nan_if_neg(ev.stats[0]), "map50": nan_if_neg(ev.stats[1]), "ap_per_class": ap}
+
+
+# class_id model -> category_id GT; mana yang benar bergantung pada cara rfdetr memberi nomor kelas, jadi dicari otomatis.
+MAPPINGS = {
+    "direct": lambda c, cat_ids, real_ids: c if c in cat_ids else None,
+    "index_all": lambda c, cat_ids, real_ids: cat_ids[c] if 0 <= c < len(cat_ids) else None,
+    "index_real": lambda c, cat_ids, real_ids: real_ids[c] if 0 <= c < len(real_ids) else None,
+}
+
+
+def resolve_mapping(cat_ids: list[int], real_ids: list[int], raw_class_ids: set[int], scores: dict[str, float] | None = None) -> str:
+    """Pilih mapping yang memetakan semua class_id terprediksi. Bila ada beberapa kandidat: yang mAP-nya tertinggi
+    (scores, nama -> mAP), atau index_real bila scores tidak diberikan."""
+    valid = [n for n, f in MAPPINGS.items() if all(f(c, cat_ids, real_ids) is not None for c in raw_class_ids)]
+    if not valid:
+        raise ValueError(f"Tidak ada mapping yang cocok untuk class_id {sorted(raw_class_ids)} (kategori {cat_ids})")
+    if scores:
+        return max(valid, key=lambda n: scores.get(n, float("-inf")))
+    return "index_real" if "index_real" in valid else valid[0]
