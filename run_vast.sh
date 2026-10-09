@@ -27,10 +27,16 @@ if ! command -v uv >/dev/null 2>&1; then
   curl -LsSf https://astral.sh/uv/install.sh | sh
   export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 fi
-[ -d .venv ] || uv venv
-# shellcheck disable=SC1091
-. .venv/bin/activate
+# Template vast.ai (mis. PyTorch (Vast)) sudah mengaktifkan venv berisi torch: pakai itu, jangan unduh torch lagi.
+if [ -z "${VIRTUAL_ENV:-}" ]; then
+  [ -d .venv ] || uv venv
+  # shellcheck disable=SC1091
+  . .venv/bin/activate
+fi
 uv pip install -r requirements.txt
+
+# 2b) torch harus punya kernel untuk GPU ini (GPU Blackwell/RTX 50 butuh CUDA 12.8+); gagal cepat sebelum training
+[ -n "${SKIP_ARCH_CHECK:-}" ] || python check_gpu.py
 
 # 3) .env: pakai pemeriksa yang sama dengan train.py (pesan jelas bila ada yang kosong)
 [ -f .env ] || { echo ".env tidak ada: salin .env.example ke .env dan isi." >&2; exit 1; }

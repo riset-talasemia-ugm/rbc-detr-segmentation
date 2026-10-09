@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from check_gpu import arch_supported
 from evaluate import Instances, aggregate, panel_state, result_is_current, write_summary, coco_map, count_gflops, gt_instances, plot_confusion, remap_instances, save_panel, confusion_matrix, match_instances, load_predictor, summarize, to_instances
 from train import done_matches, load_env, resolve_out, write_done, load_or_create_folds, make_folds, merge_coco, write_fold_dir
 
@@ -520,6 +521,16 @@ def test_write_summary_pooled_per_class_and_fp32_cost_copy():
         assert abs(float(rows["fp32"]["pooled_precision_micro"]) - 3 / 4) < 1e-9  # TP=3, FP=1 dari cm gabungan
         pc = list(csv.DictReader(open(out / "results" / "fp32" / "per_class.csv", encoding="utf-8")))
         assert [r["class"] for r in pc] == ["a", "b"] and abs(float(pc[0]["ap_mean"]) - 0.5) < 1e-9
+
+
+def test_arch_supported_requires_exact_gpu_architecture():
+    old_torch = ["sm_50", "sm_80", "sm_86", "sm_90", "compute_90"]  # build CUDA 12.4: tanpa Blackwell
+    new_torch = old_torch + ["sm_100", "sm_120", "compute_120"]  # build CUDA 12.8+
+    assert arch_supported((8, 6), old_torch)  # RTX 3090
+    assert not arch_supported((12, 0), old_torch)  # RTX 50-series: PTX compute_90 tidak diandalkan
+    assert arch_supported((12, 0), new_torch)
+    assert not arch_supported((8, 9), ["sm_80", "sm_86"])  # RTX 4090 butuh sm_89
+    assert not arch_supported((12, 0), [])
 
 
 if __name__ == "__main__":
