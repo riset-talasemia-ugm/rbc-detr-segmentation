@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from evaluate import Instances, coco_map, confusion_matrix, match_instances, resolve_mapping, summarize, to_instances
+from evaluate import Instances, coco_map, confusion_matrix, match_instances, load_predictor, resolve_mapping, summarize, to_instances
 from train import load_env, load_or_create_folds, make_folds, merge_coco, write_fold_dir
 
 
@@ -263,6 +263,101 @@ def test_prune_unstructured_keeps_checkpoint_format():
         out = torch.load(t / "sub" / "out.pth", weights_only=False)
         assert out["args"] == {"epochs": 1} and out["model_config"] == {"x": 1}
         assert abs((out["model"]["weight"] == 0).float().mean().item() - sparsity) < 1e-9 and sparsity > 0.4
+
+
+def test_prune_ffn_pair_shapes_and_output():
+    import torch
+    import torch.nn as nn
+
+    from compress import prune_ffn_pair
+
+    torch.manual_seed(0)
+    l1, l2 = nn.Linear(8, 16), nn.Linear(16, 8)
+    with torch.no_grad():
+        dead = [1, 5, 9, 14]  # neuron "mati": bobot masuk dan keluar nol -> paling tidak penting
+        l1.weight[dead] = 0
+        l1.bias[dead] = 0
+        l2.weight[:, dead] = 0
+    n1, n2 = prune_ffn_pair(l1, l2, ratio=0.25)
+    assert n1.weight.shape == (12, 8) and n1.bias.shape == (12,) and n2.weight.shape == (8, 12)
+    x = torch.randn(5, 8)
+    assert torch.allclose(n2(torch.relu(n1(x))), l2(torch.relu(l1(x))), atol=1e-6)
+    assert torch.equal(n2.bias, l2.bias)
+
+
+def test_prune_ffn_finds_both_naming_schemes():
+    import torch.nn as nn
+
+    from compress import prune_ffn
+
+    class Layer(nn.Module):
+        def __init__(self, a, b, d=8, h=16):
+            super().__init__()
+            setattr(self, a, nn.Linear(d, h))
+            setattr(self, b, nn.Linear(h, d))
+
+    net = nn.ModuleDict({"dec": Layer("linear1", "linear2"), "mlp": Layer("fc1", "fc2"), "other": nn.Linear(8, 8)})
+    kept = prune_ffn(net, ratio=0.5)
+    assert kept == 0.5
+    assert net["dec"].linear1.out_features == 8 and net["dec"].linear2.in_features == 8
+    assert net["mlp"].fc1.out_features == 8 and net["mlp"].fc2.in_features == 8
+    assert net["other"].out_features == 8
+
+
+def test_pruned_real_model_reloads_via_shrink_like():
+    try:
+        import torch
+        from rfdetr import RFDETRSegSmall
+    except ImportError:
+        print("SKIP test_pruned_real_model_reloads_via_shrink_like (rfdetr tidak terpasang)")
+        return
+    from compress import prune_ffn, shrink_like
+
+    mod = RFDETRSegSmall(pretrain_weights=None, device="cpu", num_classes=3).model.model
+    full_params = sum(p.numel() for p in mod.parameters())
+    kept = prune_ffn(mod, ratio=0.25)
+    assert abs(kept - 0.75) < 0.01
+    sd = {k: v.clone() for k, v in mod.state_dict().items()}
+    assert sum(p.numel() for p in mod.parameters()) < full_params
+    fresh = RFDETRSegSmall(pretrain_weights=None, device="cpu", num_classes=3).model.model
+    shrink_like(fresh, sd)
+    fresh.load_state_dict(sd, strict=True)  # bentuk harus cocok persis
+
+
+def test_structured_variant_loads_and_predicts_on_cpu():
+    try:
+        import torch
+        from rfdetr import RFDETRSegSmall
+    except ImportError:
+        print("SKIP test_structured_variant_loads_and_predicts_on_cpu (rfdetr tidak terpasang)")
+        return
+    from compress import prune_ffn
+
+    with tempfile.TemporaryDirectory() as t:
+        t = Path(t)
+        mod = RFDETRSegSmall(pretrain_weights=None, device="cpu", num_classes=3).model.model
+        prune_ffn(mod, 0.25)
+        dest = t / "variants" / "prune_structured"
+        dest.mkdir(parents=True)
+        torch.save({"model": mod.state_dict()}, dest / "weights.pth")
+        pred = load_predictor("prune_structured", t, num_classes=3)
+        assert pred.name == "prune_structured"
+        det = pred.predict(Image.new("RGB", (96, 64), (90, 90, 90)), threshold=0.0)
+        inst = to_instances(det, (64, 96), num_classes=3)
+        assert inst.masks.shape[1:] == (64, 96)  # mask berukuran gambar asli, bukan 640x640
+        assert inst.class_id.size == 0 or inst.class_id.max() < 3
+
+
+def test_to_instances_drops_background_slot():
+    import supervision as sv
+
+    m = rect_masks(A, B, C_, size=10)
+    det = sv.Detections(xyxy=np.zeros((3, 4)), mask=m, class_id=np.array([0, 3, 2]), confidence=np.array([0.9, 0.8, 0.7]))
+    got = to_instances(det, (10, 10), num_classes=3)  # class_id == num_classes adalah slot no-object rfdetr
+    assert got.class_id.tolist() == [0, 2] and got.score.tolist() == [0.9, 0.7]
+    assert np.array_equal(got.masks, m[[0, 2]])
+    only_bg = sv.Detections(xyxy=np.zeros((1, 4)), mask=m[:1], class_id=np.array([3]), confidence=np.array([0.5]))
+    assert to_instances(only_bg, (10, 10), num_classes=3).masks.shape == (0, 10, 10)
 
 
 if __name__ == "__main__":

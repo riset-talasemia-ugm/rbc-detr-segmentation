@@ -153,11 +153,13 @@ class TorchPredictor:
         return self.model.predict(image, threshold=threshold)
 
 
-def to_instances(det, size: tuple[int, int]) -> Instances:
-    """sv.Detections -> Instances. size = (tinggi, lebar) gambar asli. Tanpa mask -> tidak ada instance."""
+def to_instances(det, size: tuple[int, int], num_classes: int | None = None) -> Instances:
+    """sv.Detections -> Instances. size = (tinggi, lebar) gambar asli. Tanpa mask -> tidak ada instance.
+    class_id >= num_classes adalah slot no-object rfdetr (muncul pada threshold rendah) dan dibuang."""
     if det.mask is None or len(det) == 0:
         return Instances(np.zeros((0, *size), bool), np.zeros(0, int), np.zeros(0, float))
-    return Instances(det.mask.astype(bool), det.class_id.astype(int), det.confidence.astype(float))
+    keep = np.ones(len(det), bool) if num_classes is None else det.class_id < num_classes
+    return Instances(det.mask[keep].astype(bool), det.class_id[keep].astype(int), det.confidence[keep].astype(float))
 
 
 def load_predictor(variant: str, fold_dir: Path, num_classes: int) -> Predictor:
@@ -169,5 +171,17 @@ def load_predictor(variant: str, fold_dir: Path, num_classes: int) -> Predictor:
         model = RFDETRSegSmall(pretrain_weights=str(weights), num_classes=num_classes)
         if variant == "fp16":
             model.inference(compile=False, inplace=True, dtype="float16")  # tidak dapat dibalik; hanya untuk inference
+        return TorchPredictor(variant, model)
+    if variant == "prune_structured":
+        import torch
+        from rfdetr import RFDETRSegSmall
+
+        from compress import shrink_like
+
+        model = RFDETRSegSmall(pretrain_weights=None, num_classes=num_classes)
+        sd = torch.load(Path(fold_dir) / "variants/prune_structured/weights.pth", map_location="cpu", weights_only=False)["model"]
+        shrink_like(model.model.model, sd)  # dimensi FFN mengecil; bentuk harus cocok persis
+        model.model.model.load_state_dict(sd, strict=True)
+        model.model.model.eval()
         return TorchPredictor(variant, model)
     raise NotImplementedError(variant)
