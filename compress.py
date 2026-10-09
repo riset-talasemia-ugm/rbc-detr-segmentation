@@ -6,7 +6,7 @@ import time
 import traceback
 from pathlib import Path
 
-from train import done_matches, drop_checkpoints, fmt_duration, resolve_out, write_done
+from train import AUG_CHOICES, KFOLD_CHOICES, done_matches, drop_checkpoints, fmt_duration, get_aug_config, resolve_out, write_done
 
 try:
     from onnxruntime.quantization import CalibrationDataReader as _ReaderBase
@@ -100,7 +100,7 @@ def shrink_like(module, sd: dict) -> None:
         setattr(owner, b, nn.Linear(k, l2.out_features, bias=l2.bias is not None).to(l2.weight))
 
 
-def prune_structured(fold: Path, weights_out: Path, ratio: float = 0.3, finetune_epochs: int = 5) -> dict:
+def prune_structured(fold: Path, weights_out: Path, ratio: float = 0.3, finetune_epochs: int = 5, aug_config=None) -> dict:
     """Pangkas FFN lalu fine-tune singkat di data latih fold. Bobot EMA akhir disimpan ke weights_out."""
     import rfdetr.training as T
     from rfdetr import RFDETRSegSmall
@@ -118,7 +118,8 @@ def prune_structured(fold: Path, weights_out: Path, ratio: float = 0.3, finetune
     T.RFDETRModelModule = PrunedModule
     try:
         RFDETRSegSmall(pretrain_weights=str(fold / "weights.pth"), num_classes=num_classes).train(
-            dataset_dir=str(fold / "dataset"), epochs=finetune_epochs, batch_size="auto", lr=1e-4, output_dir=str(run_dir)
+            dataset_dir=str(fold / "dataset"), epochs=finetune_epochs, batch_size="auto", lr=1e-4, output_dir=str(run_dir),
+            **({} if aug_config is None else {"aug_config": aug_config}),
         )
     finally:
         T.RFDETRModelModule = orig
@@ -128,7 +129,7 @@ def prune_structured(fold: Path, weights_out: Path, ratio: float = 0.3, finetune
 
 
 def build_prune_structured(fold: Path, dest: Path, args) -> dict:
-    return prune_structured(fold, dest / "weights.pth", args.structured_ratio, args.finetune_epochs)
+    return prune_structured(fold, dest / "weights.pth", args.structured_ratio, args.finetune_epochs, get_aug_config(args.aug))
 
 
 class ImageCalibrationReader(_ReaderBase):
@@ -189,7 +190,7 @@ BUILDERS = {"int8": build_int8, "prune_unstructured": build_prune_unstructured, 
 VARIANT_SETTINGS = {
     "int8": lambda a: {"n_calib": a.n_calib},
     "prune_unstructured": lambda a: {"prune_amount": a.prune_amount},
-    "prune_structured": lambda a: {"structured_ratio": a.structured_ratio, "finetune_epochs": a.finetune_epochs},
+    "prune_structured": lambda a: {"structured_ratio": a.structured_ratio, "finetune_epochs": a.finetune_epochs, **({"aug": a.aug} if a.aug != "default" else {})},
 }
 
 
@@ -201,12 +202,14 @@ def main(argv=None) -> None:
     ap.add_argument("--structured-ratio", type=float, default=0.3, help="fraksi neuron FFN yang dibuang")
     ap.add_argument("--finetune-epochs", type=int, default=5)
     ap.add_argument("--n-calib", type=int, default=100, help="gambar kalibrasi INT8")
+    ap.add_argument("--aug", choices=AUG_CHOICES, default="default", help="harus sama dengan train.py (fine-tune pruning memakai augmentasi yang sama)")
+    ap.add_argument("--kfold", choices=KFOLD_CHOICES, default="on", help="harus sama dengan train.py (off: hanya fold 0)")
     ap.add_argument("--smoke", action="store_true", help="1 fold")
     ap.add_argument("--out", type=Path, default=None, help="default outputs (outputs_smoke untuk --smoke)")
     a = ap.parse_args(argv)
-    if a.smoke:
+    if a.smoke or a.kfold == "off":
         a.folds = 1
-    a.out = resolve_out(a.out, a.smoke)
+    a.out = resolve_out(a.out, a.smoke, a.aug, a.kfold)
     for k in range(a.folds):
         fold = a.out / f"fold{k}"
         if not (fold / "DONE").exists():

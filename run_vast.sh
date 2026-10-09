@@ -2,6 +2,10 @@
 # Jalankan seluruh pipeline di instance vast.ai.
 #   bash run_vast.sh            # run penuh (5 fold) -> folder outputs
 #   bash run_vast.sh --smoke    # 1 fold, 1 epoch: cek seluruh jalur dengan biaya kecil -> folder outputs_smoke
+#   bash run_vast.sh --aug off|default|rbc   # augmentasi training: off (mati semua), default (flip horizontal saja),
+#                                             # rbc (mirip v7: flip H/V, rotasi 90, warna, blur, noise); folder terpisah
+#   bash run_vast.sh --no-kfold               # satu hold-out saja (fold 0), tanpa cross-validation; folder *_holdout
+#   (opsi bisa digabung, mis. --smoke --aug rbc --no-kfold -> outputs_smoke_rbc_holdout)
 # Smoke dan run penuh memakai folder berbeda supaya hasil smoke tidak ikut terhitung di run penuh.
 # Pipeline berjalan di nohup (koneksi SSH putus tidak mematikannya); log: <folder>/run.log.
 # Selesai bila log berakhir "PIPELINE SELESAI"; hasil dibungkus di <folder>/results.tar.gz.
@@ -12,8 +16,28 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 SMOKE=""
+AUG=""    # --aug off|default|rbc, diteruskan ke train/compress/evaluate
+KFOLD=""  # --no-kfold -> --kfold off (satu hold-out saja)
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --smoke) SMOKE="--smoke" ;;
+    --aug)
+      shift
+      case "${1:-}" in
+        off|default|rbc) AUG="--aug $1" ;;
+        *) echo "--aug: pilihan off, default, rbc" >&2; exit 2 ;;
+      esac ;;
+    --no-kfold) KFOLD="--kfold off" ;;
+    *) echo "argumen tidak dikenal: $1 (pilihan: --smoke, --aug off|default|rbc, --no-kfold)" >&2; exit 2 ;;
+  esac
+  shift
+done
+# folder keluaran: sama persis dengan resolve_out di train.py
 OUT=outputs
-if [ "${1:-}" = "--smoke" ]; then SMOKE="--smoke"; OUT=outputs_smoke; fi
+if [ -n "$SMOKE" ]; then OUT="${OUT}_smoke"; fi
+if [ "$AUG" = "--aug off" ]; then OUT="${OUT}_off"; fi
+if [ "$AUG" = "--aug rbc" ]; then OUT="${OUT}_rbc"; fi
+if [ -n "$KFOLD" ]; then OUT="${OUT}_holdout"; fi
 
 # 1) GPU dulu: gagal cepat sebelum memasang apa pun
 if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
@@ -44,7 +68,7 @@ python -c "from dotenv import load_dotenv; load_dotenv(); from train import load
 
 # 4) pipeline di nohup; hasil dibungkus bila semua langkah berhasil
 mkdir -p "$OUT"
-nohup bash -c "python train.py $SMOKE && python compress.py $SMOKE && python evaluate.py $SMOKE \
+nohup bash -c "python train.py $SMOKE $AUG $KFOLD && python compress.py $SMOKE $AUG $KFOLD && python evaluate.py $SMOKE $AUG $KFOLD \
   && tar czf $OUT/results.tar.gz -C $OUT results && echo \"PIPELINE SELESAI (total \$((SECONDS / 60)) menit)\" || echo \"PIPELINE GAGAL (setelah \$((SECONDS / 60)) menit)\"" \
   > "$OUT/run.log" 2>&1 &
 echo "Pipeline berjalan di latar belakang (PID $!). Pantau: tail -f $OUT/run.log"

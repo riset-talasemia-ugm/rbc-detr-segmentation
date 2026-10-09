@@ -10,7 +10,7 @@ from PIL import Image
 from check_gpu import arch_supported
 from evaluate import _warm_cuda, measure_cost, ort_model_latency
 from evaluate import Instances, aggregate, panel_state, result_is_current, write_summary, coco_map, count_gflops, gt_instances, plot_confusion, remap_instances, save_panel, confusion_matrix, match_instances, load_predictor, summarize, to_instances
-from train import done_matches, drop_checkpoints, eta_line, fmt_duration, folds_by_filename, load_env, resolve_out, write_done, load_or_create_folds, make_folds, merge_coco, write_fold_dir
+from train import AUG_RBC, done_matches, drop_checkpoints, eta_line, fmt_duration, folds_by_filename, get_aug_config, make_settings, load_env, resolve_out, write_done, load_or_create_folds, make_folds, merge_coco, write_fold_dir
 
 
 def synthetic_coco(n_images=10, class1_images=(0, 2, 4, 6, 8), with_empty=()):
@@ -466,6 +466,11 @@ def test_resolve_out_keeps_smoke_apart_from_full_run():
     assert resolve_out(None, smoke=False) == Path("outputs")
     assert resolve_out(None, smoke=True) == Path("outputs_smoke")  # smoke tidak boleh menimpa/dipakai ulang oleh run penuh
     assert resolve_out(Path("x"), smoke=True) == Path("x")  # --out eksplisit selalu menang
+    assert resolve_out(None, smoke=False, aug="rbc") == Path("outputs_rbc")  # augmentasi berbeda: folder berbeda
+    assert resolve_out(None, smoke=True, aug="rbc") == Path("outputs_smoke_rbc")
+    assert resolve_out(None, smoke=False, aug="off") == Path("outputs_off")
+    assert resolve_out(None, smoke=False, aug="default", kfold="off") == Path("outputs_holdout")  # tanpa k-fold: hold-out
+    assert resolve_out(None, smoke=True, aug="rbc", kfold="off") == Path("outputs_smoke_rbc_holdout")
 
 
 def test_done_stamp_matches_only_identical_settings():
@@ -616,6 +621,66 @@ def test_folds_by_filename_partitions_all_images_with_class_names():
     by_id = {im["id"]: im["file_name"] for im in coco["images"]}
     assert [sorted(by_id[i] for i in f) for f in folds] == out["folds"]  # sama dengan folds.json, hanya nama file
     json.dumps(out)  # bisa diserialisasi
+
+
+def test_get_aug_config_and_settings_stamp():
+    assert get_aug_config("default") is None  # perilaku lama: default RF-DETR (flip horizontal saja)
+    assert get_aug_config("rbc") == AUG_RBC
+    assert get_aug_config("off") == {} and get_aug_config("off") is not None  # {} mematikan semua augmentasi (None = default RF-DETR)
+    for name in ("HorizontalFlip", "VerticalFlip", "RandomRotate90", "ColorJitter", "GaussianBlur", "GaussNoise"):
+        assert name in AUG_RBC
+    try:
+        get_aug_config("tidak-ada")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("nama augmentasi tak dikenal harus ditolak")
+    base = {"epochs": 50, "seed": 0, "k": 5, "version": 8}
+    assert make_settings(50, 0, 8, "default") == base  # stempel run lama tetap cocok (tanpa kunci aug)
+    assert make_settings(50, 0, 8, "rbc") == {**base, "aug": "rbc"}  # augmentasi berbeda tidak pernah tercampur
+    assert make_settings(50, 0, 8, "off") == {**base, "aug": "off"}
+    assert make_settings(50, 0, 8, "default", "off") == {**base, "kfold": "off"}  # hold-out tidak tercampur dengan k-fold
+    assert make_settings(50, 0, 8, "rbc", "off") == {**base, "aug": "rbc", "kfold": "off"}
+    assert make_settings(50, 0, 8, "default", "on") == base
+
+
+def test_rbc_aug_is_accepted_and_keeps_boxes_and_masks_consistent():
+    try:
+        import albumentations  # noqa: F401
+        import torch
+        from rfdetr.datasets.transforms import AlbumentationsWrapper
+    except ImportError:
+        print("SKIP test_rbc_aug_is_accepted_and_keeps_boxes_and_masks_consistent (albumentations/rfdetr tidak terpasang)")
+        return
+
+    wrappers = AlbumentationsWrapper.from_config(AUG_RBC, strict=True)  # parameter harus valid di versi Albumentations terpasang
+    assert len(wrappers) == len(AUG_RBC)
+    rng = np.random.default_rng(0)
+    for trial in range(40):
+        np.random.seed(trial)
+        import random as _r
+
+        _r.seed(trial)
+        img = Image.fromarray(rng.integers(0, 255, (96, 96, 3), dtype=np.uint8))
+        masks = np.zeros((2, 96, 96), np.uint8)
+        masks[0, 10:30, 20:60] = 1  # persegi panjang tidak simetris agar rotasi/flip terlihat
+        masks[1, 60:80, 10:25] = 1
+        target = {
+            "labels": torch.tensor([0, 1]),
+            "boxes": torch.tensor([[20.0, 10.0, 60.0, 30.0], [10.0, 60.0, 25.0, 80.0]]),
+            "masks": torch.from_numpy(masks.astype(bool)),
+            "iscrowd": torch.zeros(2, dtype=torch.int64),
+            "area": torch.tensor([800.0, 300.0]),
+        }
+        for w in wrappers:
+            img, target = w(img, target)
+        assert img.size == (96, 96)
+        n = len(target["labels"])
+        assert n == 2 and target["masks"].shape == (n, 96, 96) and target["boxes"].shape == (n, 4)
+        for m, b, area in zip(target["masks"].numpy(), target["boxes"].numpy(), (800, 300)):
+            ys, xs = np.nonzero(m)
+            assert ys.size == area  # flip/rot90 tidak mengubah luas mask
+            assert abs(xs.min() - b[0]) <= 2 and abs(xs.max() + 1 - b[2]) <= 2 and abs(ys.min() - b[1]) <= 2 and abs(ys.max() + 1 - b[3]) <= 2
 
 
 if __name__ == "__main__":

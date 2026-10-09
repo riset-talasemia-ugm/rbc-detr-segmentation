@@ -9,3 +9,5 @@ onnx
 onnxruntime-gpu
 nvidia-ml-py
 matplotlib
+# Jangan tambahkan kornia: jalur augmentasi GPU Kornia tidak mendukung RandomRotate90 (augmentasi --aug rbc).
+albumentations

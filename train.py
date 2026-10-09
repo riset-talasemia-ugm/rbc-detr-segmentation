@@ -42,9 +42,48 @@ def drop_checkpoints(run_dir: Path) -> None:
             f.unlink()
 
 
-def resolve_out(out, smoke: bool) -> Path:
-    """Folder keluaran: --out eksplisit; bila tidak, smoke memakai outputs_smoke agar tidak bercampur dengan run penuh."""
-    return Path(out) if out else Path("outputs_smoke" if smoke else "outputs")
+# Augmentasi saat training (diterapkan per gambar latih; dataset sendiri tanpa augmentasi supaya fold tidak bocor).
+# Pendekatan set augmentasi v7 di Roboflow: flip H/V, rotasi 90 derajat, hue +-10 derajat (0.03 dari siklus), saturasi +-15%,
+# kecerahan +-20%, blur ringan (sigma <= 1.5), noise ringan. Probabilitas per gambar; bukan salinan 3x seperti v7.
+# ponytail: hanya nama transformasi Albumentations (jalur CPU). Jangan pasang kornia: jalur GPU Kornia tidak mendukung RandomRotate90.
+AUG_RBC = {
+    "HorizontalFlip": {"p": 0.5},
+    "VerticalFlip": {"p": 0.5},
+    "RandomRotate90": {"p": 0.5},
+    "ColorJitter": {"brightness": 0.2, "contrast": 0.0, "saturation": 0.15, "hue": 0.03, "p": 0.5},
+    "GaussianBlur": {"blur_limit": (3, 5), "sigma_limit": (0.1, 1.5), "p": 0.2},
+    "GaussNoise": {"std_range": (0.0, 0.02), "p": 0.2},
+}
+
+
+AUG_CHOICES = ("off", "default", "rbc")
+KFOLD_CHOICES = ("on", "off")
+
+
+def get_aug_config(name: str):
+    """'off' = {} (semua augmentasi mati); 'default' = None (default RF-DETR: hanya flip horizontal); 'rbc' = AUG_RBC (mirip v7)."""
+    if name == "off":
+        return {}
+    if name == "default":
+        return None
+    if name == "rbc":
+        return AUG_RBC
+    raise ValueError(f"augmentasi tidak dikenal: {name!r} (pilihan: {', '.join(AUG_CHOICES)})")
+
+
+def make_settings(epochs: int, seed: int, version: int, aug: str, kfold: str = "on") -> dict:
+    """Pengaturan yang dicap pada DONE. Kunci aug/kfold hanya ada bila bukan default, jadi stempel run lama tetap cocok."""
+    settings = {"epochs": epochs, "seed": seed, "k": K, "version": version}
+    if aug != "default":
+        settings["aug"] = aug
+    if kfold != "on":
+        settings["kfold"] = kfold
+    return settings
+
+
+def resolve_out(out, smoke: bool, aug: str = "default", kfold: str = "on") -> Path:
+    """Folder keluaran: --out eksplisit; bila tidak, smoke, augmentasi, dan hold-out punya folder sendiri agar hasil tidak bercampur."""
+    return Path(out) if out else Path("outputs" + ("_smoke" if smoke else "") + ("" if aug == "default" else f"_{aug}") + ("" if kfold == "on" else "_holdout"))
 
 
 def write_done(path: Path, settings: dict) -> None:
@@ -206,11 +245,15 @@ def main(argv=None) -> None:
     ap.add_argument("--smoke", action="store_true", help="1 fold, 1 epoch")
     ap.add_argument("--out", type=Path, default=None, help="default outputs (outputs_smoke untuk --smoke)")
     ap.add_argument("--data", type=Path, default=Path("data"))
+    ap.add_argument("--aug", choices=AUG_CHOICES, default="default", help="augmentasi training: off (mati semua), default (flip horizontal saja, bawaan RF-DETR), rbc (mirip v7); folder keluaran terpisah")
+    ap.add_argument("--kfold", choices=KFOLD_CHOICES, default="on", help="on: cross-validation 5 fold; off: satu pembagian hold-out saja (fold 0, folder terpisah)")
     ap.add_argument("--export-folds", action="store_true", help="tulis folds_by_filename.json dari <out>/folds.json lalu keluar (tanpa training)")
     a = ap.parse_args(argv)
     if a.smoke:
         a.folds, a.epochs = 1, 1
-    a.out = resolve_out(a.out, a.smoke)
+    if a.kfold == "off":
+        a.folds = 1  # hold-out: hanya fold 0 (pembagian yang sama dengan fold 0 run k-fold, jadi sebanding)
+    a.out = resolve_out(a.out, a.smoke, a.aug, a.kfold)
 
     if a.export_folds:  # tanpa .env/Roboflow/GPU: hanya butuh outputs/merged dan outputs/folds.json hasil run
         coco = json.loads((a.out / "merged" / ANN_NAME).read_text(encoding="utf-8"))
@@ -239,7 +282,7 @@ def main(argv=None) -> None:
 
     from rfdetr import RFDETRSegSmall
 
-    settings = {"epochs": a.epochs, "seed": a.seed, "k": K, "version": env["version"]}
+    settings = make_settings(a.epochs, a.seed, env["version"], a.aug, a.kfold)
     pending = sum(1 for k in range(min(a.folds, K)) if not done_matches(a.out / f"fold{k}" / "DONE", settings))
     durations = []
     for k in range(min(a.folds, K)):
@@ -255,7 +298,9 @@ def main(argv=None) -> None:
         train_coco = json.loads((ds_dir / "train" / ANN_NAME).read_text(encoding="utf-8"))
         (fold / "classes.json").write_text(json.dumps(fold_classes(train_coco)), encoding="utf-8")
         # Bobot terakhir (EMA akhir), bukan checkpoint_best_*: yang terbaik dipilih di fold valid sehingga skornya optimistis.
-        RFDETRSegSmall().train(dataset_dir=str(ds_dir), epochs=a.epochs, batch_size="auto", lr=1e-4, output_dir=str(fold / "run"))
+        aug_cfg = get_aug_config(a.aug)
+        aug_kwargs = {} if aug_cfg is None else {"aug_config": aug_cfg}  # None: jangan kirim apa pun (perilaku default tak berubah)
+        RFDETRSegSmall().train(dataset_dir=str(ds_dir), epochs=a.epochs, batch_size="auto", lr=1e-4, output_dir=str(fold / "run"), **aug_kwargs)
         shutil.copy2(fold / "run" / "last_ema.pth", fold / "weights.pth")
         drop_checkpoints(fold / "run")
         write_done(fold / "DONE", settings)

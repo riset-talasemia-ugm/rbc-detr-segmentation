@@ -54,13 +54,28 @@ Annotations are expected in COCO instance format (polygon or RLE masks). Dataset
 
    The dataset is saved under `data/`, which is git-ignored.
 
+## Experiment switches
+
+`train.py`, `compress.py` and `evaluate.py` take the same switches (pass the same values to all three; `run_vast.sh` does that for you). Each combination writes to its own output folder so results are never mixed:
+
+| Switch | Values | Meaning |
+|---|---|---|
+| `--aug` | `off` / `default` / `rbc` | Training augmentation. `off`: none at all. `default`: RF-DETR's own default (horizontal flip only). `rbc`: approximates the old Roboflow v7 set (flip H/V, 90-degree rotation, hue/saturation/brightness, light blur and noise), applied per image during training. The dataset itself stays without augmentation so folds cannot leak. |
+| `--kfold` | `on` / `off` | `on`: 5-fold cross-validation. `off`: a single hold-out split (fold 0 only, the same split as fold 0 of the k-fold run), reported without a standard deviation. |
+| `--folds N` | integer | Run only the first N folds. |
+| `--smoke` | flag | 1 fold, 1 epoch, to check the whole path cheaply. |
+| `--variants` | names | `compress.py` / `evaluate.py` only: which variants to build or evaluate. |
+| `--n-visual`, `--cost-images` | integers | `evaluate.py`: number of comparison panels per fold, images used for the cost measurement. |
+
+Output folders: `outputs[_smoke][_off|_rbc][_holdout]`, for example `--smoke --aug rbc --no-kfold` writes to `outputs_smoke_rbc_holdout`. With `run_vast.sh`: `bash run_vast.sh --aug rbc`, `bash run_vast.sh --aug off --no-kfold`.
+
 ## Comparing other models (shared protocol)
 
 Several models (RF-DETR, YOLO-seg, a YOLO student trained with knowledge distillation) are compared on the same data. The comparison is only fair if everyone follows the same protocol.
 
 1. **Same data:** the no-augmentation Roboflow dataset, version 8 (170 images). Do not use the augmented version: augmented copies of one image would land in both train and test.
 2. **Same folds:** use `folds_by_filename.json` (5 stratified folds, seed 0, file names per fold). For fold *k*, train on the other four folds and evaluate on fold *k* only. It is produced by `python train.py --export-folds` after a run and also lists the class order. Map YOLO classes by class name, not by index: the class order of a YOLO export can differ.
-3. **No tuning on the test fold:** fixed number of epochs and the final weights. Do not pick a checkpoint by its score on the held-out fold.
+3. **Same training recipe, written down:** the augmentation policy (`--aug`) is part of the recipe. State which one you used, and use the same one when comparing models. **No tuning on the test fold:** fixed number of epochs and the final weights. Do not pick a checkpoint by its score on the held-out fold.
 4. **Knowledge distillation:** the teacher for fold *k* must be trained only on the training images of fold *k* (a teacher trained on all 170 images leaks the test fold into the student). State the teacher in the repository README.
 5. **Same evaluation code:** a model plugs into `evaluate.py` by providing a predictor with `predict(image, threshold)` that takes a PIL image and returns a `supervision.Detections` with
    - `mask`: boolean array `(N, H, W)` at the original image size,
