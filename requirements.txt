@@ -1,7 +1,13 @@
 torch
 roboflow
-rfdetr[train]
+rfdetr[train]==1.11.2
 supervision
 pillow
 python-dotenv
 pycocotools
+onnx
+onnxruntime-gpu
+nvidia-ml-py
+matplotlib
+# Jangan tambahkan kornia: jalur augmentasi GPU Kornia tidak mendukung RandomRotate90 (augmentasi --aug rbc).
+albumentations
