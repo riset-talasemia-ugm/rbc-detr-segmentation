@@ -100,7 +100,7 @@ Mean over 5 folds (± standard deviation across folds). Detections at score ≥ 
 
 No difference in mAP. `rbc` gives slightly higher precision, but lower recall on the rare classes (recall baseline → `rbc`: Burr 0.33 → 0.20, Hypochromia 0.27 → 0.23, Microcyte 0.11 → 0.08, Schistocyte 0.39 → 0.32, Teardrop 0.10 → 0.06), so macro F1 drops. The common classes improve a little. A possible reason is that 50 epochs is too short for the stronger augmentation; this was not tested. Uncategorized is never detected in either run (AP ≈ 0).
 
-Raw numbers: `summary.csv`, `per_class.csv`, per-fold JSON and confusion matrices in each run's `results/` folder (git-ignored; shared as release assets or on request).
+Raw numbers: `summary.csv`, `per_class.csv`, per-fold JSON and confusion matrices in each run's `results/` folder.
 
 ## Comparing other models (shared protocol)
 
